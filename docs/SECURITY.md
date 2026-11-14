@@ -424,8 +424,64 @@ Step 1 of 4 toward APIC interrupts, battery and thermal readings, and sleep: the
 | What it proves | `\_S5` evaluated (not pattern-matched); the PCI root bridge's `_PRT`; battery (PNP0C0A), AC adapter (ACPI0003), power button (PNP0C0C) and thermal zones found through the namespace, `_STA` respected. | QEMU: `\_S5` = 0, 0 (agrees with the kernel's pattern match); `_PRT` has 128 entries, all through link devices (we're in PIC mode); no battery, AC, power button or thermal zone (QEMU has none). |
 
 **Next (not done yet).**
-1. APIC: local APIC and I/O APIC drivers (MADT already parsed), `\_PIC(1)`, `_PRT` routing for PCI devices, ISA overrides, the APIC timer calibrated by the HPET. Then the 8259s get masked.
-2. Events: the SCI interrupt (installing the handler is accepted but not wired), GPEs and the power button, the embedded controller, `_BIF`/`_BIX`/`_BST` battery and `_TMP`/`_CRT` thermal readings (tested in QEMU with a test SSDT via `-acpitable`), shown in KamalShell.
-3. Sleep: S5 through uACPI (`_PTS` first), then S3 with a FACS waking vector and driver suspend/resume.
+1. ✅ APIC (§18): local APIC and I/O APIC, `\_PIC(1)`, `_PRT` routing, ISA overrides, the 8259s masked. (The APIC timer is still to do.)
+2. ✅ Events, battery, thermal (§19): the SCI, GPEs, the power button, an EC driver, `_BIF`/`_BIX`/`_BST`, `_PSR`, `_TMP`/`_CRT`, shown in KamalShell.
+3. Sleep (§20): ✅ S5 through uACPI (`_PTS` first). S3 not done: it needs a display driver first (§20).
 
 **Limits now.** The kernel's own power-off still uses its pattern-matched `\_S5` (it will move to the server). Short stalls (`uacpi_kernel_stall`) spin a rough count, because the clock counts milliseconds. A 1- or 2-byte PCI config write is a read-modify-write of the dword. A semaphore wait that would block returns a timeout (one thread: nobody could signal it).
+
+## 18. From the 8259 PICs to the APICs
+
+Step 2 of 4 (§17).
+
+| Item | Design | Checked by |
+|---|---|---|
+| Local APIC and I/O APIC | `arch/x86_64/apic.cpp`, from the MADT: the local APIC is turned on (IA32_APIC_BASE, spurious vector 0xFF, TPR 0), and the I/O APIC's inputs are counted and all masked first. The kernel keeps its IRQ lines 0-15 (vector 32 + line): `Pic::mask`/`unmask`/`endOfInterrupt` act on the APICs once they're on, so drivers, IRQ objects and the PIT timer don't change. | Every boot: "interrupts through the I/O APIC (24 inputs, 2 PCI routes); the 8259 PICs are masked". The scheduler keeps ticking (PIT through GSI 2). |
+| PCI routing through `_PRT` | The acpi server evaluates `\_PIC(1)` (uACPI's interrupt model), reads the PCI root's `_PRT`, resolves link devices through their `_CRS` (GSI, trigger, polarity), and for each bus-0 function with an interrupt pin reports `GSI → its line` (`SYS_FIRMWARE_INTERRUPTS`, firmware handle, RIGHT_WRITE). Then it asks the kernel to switch. Any function it can't route, or a route the kernel refuses (a line it owns, an input that doesn't exist), means no switch: the machine stays on the PICs. | 3 PCI interrupts routed. Network interrupts arrive after the switch: DHCP and HTTP work over e1000 and rtl8139. |
+| ISA IRQs | From the MADT's overrides, with their polarity and trigger (ISA default: edge, active high), except lines a PCI route took. The PICs' open lines are opened on the I/O APIC, then both PICs are masked. | Keyboard and mouse: a click opens the Terminal, and typing works. |
+| With VT-d interrupt remapping | Remapping blocks compatibility-format interrupts (§12), which would cut off the I/O APIC on real hardware. So each I/O APIC input gets its own remapping entry (index = input; vector, trigger, this CPU) that only the I/O APIC may use: its requester id comes from DMAR's device scope, with SVT = 1. The redirection entries use the remappable format. Changing entries while remapping is on needs the interrupt entry cache flushed, which only the queued invalidation interface can do, so the IOMMU now uses that interface when it remaps interrupts (context-cache and IOTLB invalidation too, with wait descriptors). | `IOMMU=1`: every check passes through the remapping entries. `FAULT_TEST=msi` now aims the SATA controller's MSI at entry 2, which is live (the timer's): blocked, reason 0x26 (requester id doesn't match). |
+
+**Limits.**
+- The timer is still the PIT (through GSI 2). The local APIC timer, calibrated by the HPET, is a follow-up.
+- Bus 0 only: devices behind PCI bridges would need the bridge's `_PRT` or swizzling. Everything QEMU has is on bus 0.
+- One I/O APIC (the MADT's first) and one CPU. No MSI for drivers yet (it would need remapping entries per device).
+- The switch happens when the acpi server gets there, early in boot, while drivers start. Interrupts are off for the switch itself, so it's atomic, and level-triggered lines re-assert, but an edge that arrives exactly during it could be lost.
+
+## 19. ACPI events, battery and thermal
+
+Step 3 of 4 (§17).
+
+| Item | Design | Checked by |
+|---|---|---|
+| SCI | The kernel gives init an IRQ object for the FADT's SCI line (`INIT_HANDLE_SCI`, level-triggered), when no driver's line shares it. init passes it to the acpi server, which binds it to a channel and, in its loop, runs uACPI's SCI handler (fixed events, GPEs) and acknowledges. Work uACPI queues (GPE methods, notifications) runs after the handler returns, never inside it. GPEs with AML handlers are enabled (`uacpi_finalize_gpe_initialization`). | "listening for ACPI events (SCI)". Under the APIC, the SCI arrives through the I/O APIC (ISA 9, level, from the MADT), and with VT-d through its remapping entry. |
+| Power button | A fixed-event handler, plus a notify handler (0x80) on PNP0C0C devices. A press turns the machine off (S5). | QEMU `system_powerdown`: "power button pressed: turning off", "powering off (S5)", and QEMU exits. Same on UEFI with VT-d. |
+| Embedded controller | A driver for the ACPI EC protocol (status/command and data ports from the PNP0C09 device's `_CRS`; read 0x80, write 0x81, IBF/OBF waits with a timeout, so a stuck EC gives the AML an error instead of a hang), installed as the EmbeddedControl address space handler before anything reads batteries. | Not testable in QEMU (it has no EC). Code review only. |
+| Battery | For each present PNP0C0A battery: last full capacity (`_BIX` field 3, or `_BIF` field 2), `_BST` state (charging, discharging, critical) and remaining capacity, summed over batteries into a percentage. ACPI's "unknown" (0xFFFFFFFF) is skipped. | Test SSDT (`scripts/acpi-test.asl`, `make shot ACPI_TEST=1`): "1 battery, 75% charging". |
+| AC adapter | ACPI0003 `_PSR` (online if any adapter is). | Test SSDT: "on AC". |
+| Thermal | Every ThermalZone's `_TMP` (tenths of a kelvin, accepted from 100 K to 600 K), the hottest one reported with its `_CRT`. | Test SSDT: "45.0 C (critical at 100 C)". |
+| KamalShell | A power channel to the acpi server (`protocol/power.h`), set up by init. The shell asks every 5 seconds and the answer joins its wait loop. The top bar shows a battery icon with the percentage ("+" when charging; red when critical or at 10% or less) and the temperature (red within 10 °C of critical). With no acpi server (safe mode, no ACPI), the channel is closed and nothing is shown. | Screenshot with the test SSDT: battery 75% +, 45°C. Safe mode: KamalShell runs without the server. |
+
+**Limits.**
+- The power button turns the machine off at once, without asking open apps to save (the fs server keeps no unwritten data).
+- No EC query events (`_Qxx`): battery and temperature are read when asked (every 5 s), not on notification. No ECDT (an EC needed before the namespace loads).
+- No thermal policy: nothing is throttled or shut down at `_PSV`/`_HOT`/`_CRT`. The shell only colours the reading.
+- The SCI can't share a line with a driver's interrupt (one owner per line): then there are no events, and the log says so.
+- Battery percentage mixes units if two batteries report different ones (mWh and mAh). Rare.
+
+## 20. Sleep states
+
+Step 4 of 4 (§17), in part.
+
+| Item | Design | Checked by |
+|---|---|---|
+| S5 through ACPI | The acpi server turns the machine off the ACPI way: `uacpi_prepare_for_sleep_state(S5)` runs `\_PTS(5)` and `\_GTS`, then `uacpi_enter_sleep_state(S5)` writes SLP_TYP, then SLP_EN. The power button, KamalShell's Shut Down and the Terminal's `shutdown` all go through it (power protocol `PowerOff`). If ACPI can't, or there's no server (safe mode), the kernel's own S5 (§16) is the fallback. | Power button and Terminal `shutdown` (BIOS, and UEFI with VT-d): "turning off through ACPI (S5)", QEMU exits, and the kernel's fallback never runs. |
+| S3 (suspend to RAM) | **Not done.** Assessment below. | — |
+
+**What S3 needs, and the blocker.** Waking from S3 starts the CPU in real mode at the FACS waking vector with every device reset (QEMU does the same). The pieces:
+1. A wake trampoline below 1 MiB: real mode → long mode, with its own page tables mapping it and the kernel.
+2. Saving and restoring the CPU's state (control registers, GDT/IDT/TSS with the busy bit cleared, EFER, PAT, FPU), and re-initialising what the kernel owns (PICs or APICs and the I/O APIC entries, PIT, serial, and VT-d's root table, queued invalidation, interrupt remapping and translation).
+3. Returning to the acpi server where it entered sleep. uACPI's cache-flush hook (`UACPI_ARCH_FLUSH_CPU_CACHE`, called just before SLP_EN) can trap into the kernel to save state and sleep, then jump back out of `uacpi_enter_sleep_state` on wake.
+4. Suspend and resume in every driver: stop DMA before (AHCI command engine, e1000 and rtl8139 rings), re-initialise after (they come back reset). Orchestrated by init, which would have to keep a channel to each driver.
+5. **The display.** Bhairav draws on the framebuffer the firmware set up at boot, and has no graphics driver. After S3 the firmware doesn't set it up again (SeaBIOS doesn't re-run the VGA BIOS; OVMF's GOP is gone), so the screen stays black. It needs a display driver that can set the mode itself: in QEMU the Bochs/VBE "dispi" registers of the standard VGA device, on real hardware a GPU driver.
+
+1-4 are a large but well-understood piece of work. 5 is the blocker: until there's at least a QEMU display driver, S3 would resume to a black screen.

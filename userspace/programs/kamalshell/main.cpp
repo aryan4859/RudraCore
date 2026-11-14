@@ -34,6 +34,7 @@
 #include <kapala/protocol/fs.h>
 #include <kapala/protocol/input.h>
 #include <kapala/protocol/net.h>
+#include <kapala/protocol/power.h>
 #include <kapala/protocol/shell.h>
 #include <kapala/sys.h>
 #include <kapala/text.h>
@@ -51,6 +52,7 @@ constexpr Sys::Handle SCREEN = 1;
 constexpr Sys::Handle INPUT = 2;
 constexpr Sys::Handle FILES = 3;
 constexpr Sys::Handle NETWORK = 4;
+constexpr Sys::Handle POWER = 5; // the acpi server: battery and temperature (protocol/power.h)
 using Protocol::Fs::Scope;
 using Protocol::Net::Access;
 
@@ -238,12 +240,16 @@ public:
 
     [[noreturn]] void run() {
         for (;;) {
-            Sys::Handle handles[1 + MAX_WINDOWS];
-            int owners[1 + MAX_WINDOWS];
+            Sys::Handle handles[2 + MAX_WINDOWS];
+            int owners[2 + MAX_WINDOWS];
             unsigned long count = 0;
             if (_inputOpen) {
                 handles[count] = _input.handle();
                 owners[count++] = -1;
+            }
+            if (_powerOpen) {
+                handles[count] = _power.handle();
+                owners[count++] = -2;
             }
             for (int i = 0; i < MAX_WINDOWS; i++) {
                 if (_windows[i].used) {
@@ -259,11 +265,14 @@ public:
                 Sys::sleep(untilNextSecond);
 
             if (ready >= 0) {
-                if (owners[ready] < 0)
+                if (owners[ready] == -2)
+                    readPower();
+                else if (owners[ready] < 0)
                     readInput();
                 else
                     serviceClient(owners[ready]);
             }
+            askPower();
 
             tickClock();
             flush();
@@ -271,6 +280,41 @@ public:
     }
 
 private:
+    // MARK: Power (battery, AC, temperature, from the acpi server)
+
+    // Every 5 seconds: a question; the answer arrives in the loop.
+    void askPower() {
+        unsigned long now = Sys::timeMs();
+        if (not _powerOpen or (_powerAsked and now - _powerAskedAt < 5000))
+            return;
+        Protocol::Power::Request request{Protocol::Power::Op::Status};
+        if (_power.send(request) == Sys::PEER_CLOSED)
+            _powerOpen = false; // (no acpi server: safe mode, or no ACPI)
+        _powerAsked = true;
+        _powerAskedAt = now;
+    }
+
+    // Off through the acpi server (S5 with _PTS); the kernel's own S5 if
+    // there's no server or it couldn't.
+    void shutDown() {
+        Protocol::Power::Request request{Protocol::Power::Op::PowerOff};
+        if (_powerOpen and _power.send(request) == Sys::OK)
+            Sys::sleep(3000); // (normally the machine is off before this ends)
+        Sys::power(Sys::POWER_OFF);
+    }
+
+    void readPower() {
+        Protocol::Power::Status status{};
+        long r = _power.recv(status);
+        if (r == Sys::PEER_CLOSED) {
+            _powerOpen = false;
+        } else if (r == Sys::OK) {
+            _powerStatus = status;
+            _havePower = true;
+            damage(topBarRect());
+        }
+    }
+
     // MARK: Installed apps
 
     void rescanApps() {
@@ -500,8 +544,10 @@ private:
             case ShellType::Power:
                 // Only the Terminal (a built-in) may ask; an installed app can't
                 // turn the machine off.
-                if (sameString(w.program, "terminal"))
-                    Sys::power(m.x == 1 ? Sys::POWER_RESTART : Sys::POWER_OFF);
+                if (sameString(w.program, "terminal") and m.x == 1)
+                    Sys::power(Sys::POWER_RESTART);
+                else if (sameString(w.program, "terminal"))
+                    shutDown();
                 break;
             default:
                 break;
@@ -935,7 +981,7 @@ private:
             }
             break;
         case MENU_RESTART: Sys::power(Sys::POWER_RESTART); break;
-        case MENU_SHUT_DOWN: Sys::power(Sys::POWER_OFF); break;
+        case MENU_SHUT_DOWN: shutDown(); break;
         default: break;
         }
     }
@@ -1309,6 +1355,40 @@ private:
             c.fillRounded({x - 18 + b * 4, TOPBAR_H / 2 + 5 - h, 3, h}, 1,
                           _netUp ? Theme::TEXT : Theme::TEXT_DIM.withAlpha(90));
         }
+        x -= 24;
+
+        // Temperature, then the battery (what the acpi server last said).
+        if (not _havePower)
+            return;
+        auto const& p = _powerStatus;
+        if (p.temperature != Protocol::Power::UNKNOWN_TEMPERATURE) {
+            Text<16> t;
+            t.add(static_cast<long>(p.temperature / 10)).add("\xC2\xB0" "C");
+            bool hot = p.criticalTemperature != Protocol::Power::UNKNOWN_TEMPERATURE and
+                       p.temperature >= p.criticalTemperature - 100; // within 10 degrees of critical
+            x -= font.measure(t.cstr());
+            c.text({x, textY}, t.cstr(), hot ? Theme::LOTUS : Theme::TEXT_DIM, font);
+            x -= 18;
+        }
+        if (p.batteries) {
+            Text<16> t;
+            if (p.percent != Protocol::Power::UNKNOWN_PERCENT)
+                t.add(static_cast<unsigned long>(p.percent)).add("%");
+            else
+                t.add("?");
+            if (p.charging)
+                t.add(" +");
+            x -= font.measure(t.cstr());
+            c.text({x, textY}, t.cstr(), p.critical ? Theme::LOTUS : Theme::TEXT_DIM, font);
+            // A battery: outline, tip, and the charge filled in.
+            Rect body{x - 30, TOPBAR_H / 2 - 5, 22, 11};
+            c.strokeRounded(body, 2, 1, Theme::TEXT_DIM);
+            c.fill({body.right(), body.y + 3, 2, 5}, Theme::TEXT_DIM);
+            int filled = p.percent != Protocol::Power::UNKNOWN_PERCENT ? (body.w - 4) * p.percent / 100 : 0;
+            if (filled > 0)
+                c.fillRounded({body.x + 2, body.y + 2, filled, body.h - 4}, 1,
+                              p.critical or p.percent <= 10 ? Theme::LOTUS : Theme::TEXT);
+        }
     }
 
     // "Wed 11 Nov" (UTC)
@@ -1525,6 +1605,10 @@ private:
 
     Channel _input;
     bool _inputOpen = true;
+    Channel _power{POWER};
+    bool _powerOpen = true, _powerAsked = false, _havePower = false;
+    unsigned long _powerAskedAt = 0;
+    Protocol::Power::Status _powerStatus{};
 
     Point _mouse, _drawnMouse;
     unsigned _buttons = 0;

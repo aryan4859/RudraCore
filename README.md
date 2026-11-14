@@ -20,6 +20,10 @@ for both developers and end users.
 You only need [Docker Desktop](https://www.docker.com/products/docker-desktop/).
 The compiler, assembler, ISO tools and QEMU all run inside a container.
 
+To run it in VirtualBox or VMware, or on a real PC from a USB stick, see
+[docs/HARDWARE.md](docs/HARDWARE.md): the VM settings to pick, and what
+works on real hardware so far.
+
 ```powershell
 .\bhairav.ps1 toolchain   # first time, and after Dockerfile changes: build the toolchain image
 .\bhairav.ps1 build       # builds build\bhairavos.iso (and disk.img, the first time)
@@ -65,7 +69,9 @@ IOMMU=1 make shot FAULT_TEST=msi       # aim the SATA controller's MSI at the CP
 IOMMU=dma-only make shot               # VT-d without interrupt remapping
 make run-secureboot                    # UEFI Secure Boot on, only this build's key enrolled (build/secureboot.cer)
 make disk-image                        # build/bhairavos.img: GPT disk (ESP + data partition) for a USB stick or disk
+make vm-images                         # build/bhairavos.vdi and .vmdk for VirtualBox and VMware (see docs/HARDWARE.md)
 make tls-negative                      # TLS 1.3 negative tests: misbehaving servers and a tampering proxy
+make shot ACPI_TEST=1                  # boot with a test battery, AC adapter and thermal zone (QEMU has none)
 make PREVIOUS_KERNEL=old/rudracore.elf # ship a known-good kernel as the boot menu's fallback entry
 make shot FIRMWARE=uefi WAIT=9         # boot through UEFI instead of BIOS
 STEP=0.1 MONITOR="..." make shot       # faster mouse commands (e.g. double clicks)

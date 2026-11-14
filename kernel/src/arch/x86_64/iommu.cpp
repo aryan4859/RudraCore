@@ -24,7 +24,7 @@ constexpr usize MAX_DOMAINS = 32;
 
 // Registers
 constexpr u64 CAP = 0x08, ECAP = 0x10, GCMD = 0x18, GSTS = 0x1C, RTADDR = 0x20, CCMD = 0x28, FSTS = 0x34,
-              IQH = 0x80, IQT = 0x88, IQA = 0x90, IRTA = 0xB8;
+              IQT = 0x88, IQA = 0x90, IRTA = 0xB8;
 constexpr u32 TRANSLATION_ENABLE = 1u << 31, SET_ROOT_POINTER = 1u << 30;
 constexpr u32 INTERRUPT_REMAP_ENABLE = 1u << 25, SET_INTERRUPT_TABLE = 1u << 24, COMPATIBILITY_ALLOWED = 1u << 23;
 constexpr u64 ECAP_INTERRUPT_REMAPPING = 1u << 3, ECAP_QUEUED_INVALIDATION = 1u << 1;
@@ -187,6 +187,65 @@ Domain* domainFor(Pci::Address a) {
     return &d;
 }
 
+// A device scope's endpoint (single-level path): its PCI address.
+bool scopeDevice(u8 const* scope, Pci::Address& out) {
+    if (scope[0] != 1 or scope[1] < 8) // type 1: a PCI endpoint
+        return false;
+    out = {scope[5], static_cast<u8>(scope[6] & 31), static_cast<u8>(scope[7] & 7)};
+    return true;
+}
+
+// A unit that only covers display controllers (Intel's integrated graphics
+// has one of its own). Translating it would cut off the screen's DMA, and
+// Bhairav doesn't drive the GPU, so such a unit is left off.
+bool graphicsOnly(u8 const* dmar, u32 at, u16 size) {
+    if (dmar[at + 4] & 1) // INCLUDE_PCI_ALL: covers everything else
+        return false;
+    bool any = false;
+    for (u32 scope = at + 16; scope + 8 <= at + size;) {
+        u8 length = dmar[scope + 1];
+        if (length < 8 or scope + length > at + size)
+            return false;
+        Pci::Address a;
+        if (not scopeDevice(dmar + scope, a) or (Pci::read32(a, 0x08) >> 24) != 0x03)
+            return false;
+        any = true;
+        scope += length;
+    }
+    return any;
+}
+
+// Reserved memory regions (RMRRs): memory firmware keeps using by DMA
+// behind the OS's back, typically USB legacy keyboard emulation. Each
+// listed device gets it mapped 1:1 before translation is turned on.
+void mapReserved(u8 const* dmar, u32 length) {
+    for (u32 at = 48; at + 4 <= length;) {
+        u16 type = *reinterpret_cast<u16 const*>(dmar + at);
+        u16 size = *reinterpret_cast<u16 const*>(dmar + at + 2);
+        if (size < 4 or at + size > length)
+            break;
+        if (type == 1 and size >= 24) {
+            u64 base = *reinterpret_cast<u64 const*>(dmar + at + 8);
+            u64 limit = *reinterpret_cast<u64 const*>(dmar + at + 16);
+            for (u32 scope = at + 24; scope + 8 <= at + size and limit > base;) {
+                u8 scopeLength = dmar[scope + 1];
+                if (scopeLength < 8)
+                    break;
+                Pci::Address a;
+                if (scopeDevice(dmar + scope, a)) {
+                    if (allow(a, base, limit - base + 1))
+                        log("[iommu] firmware DMA region ", Hex{base}, "-", Hex{limit}, " kept for device ", a.bus, ":",
+                            a.device, ".", a.function);
+                    else
+                        log("[iommu] couldn't keep a firmware DMA region (out of memory)");
+                }
+                scope += scopeLength;
+            }
+        }
+        at += size;
+    }
+}
+
 } // namespace
 
 void init(Boot::Info const& info) {
@@ -202,7 +261,9 @@ void init(Boot::Info const& info) {
         u16 size = *reinterpret_cast<u16 const*>(dmar + at + 2);
         if (size < 4)
             break;
-        if (type == 0 and unitCount < MAX_UNITS) { // DRHD: one remapping unit
+        if (type == 0 and unitCount < MAX_UNITS and graphicsOnly(dmar, at, size)) {
+            log("[iommu] the integrated graphics' own VT-d unit is left off (the screen's DMA)");
+        } else if (type == 0 and unitCount < MAX_UNITS) { // DRHD: one remapping unit
             u64 base = *reinterpret_cast<u64 const*>(dmar + at + 8);
             Unit& u = units[unitCount++];
             u.regs = static_cast<u8 volatile*>(Acpi::map(base, 2 * Mem::PAGE_SIZE, Vmm::Cache::Uncached));
@@ -252,6 +313,7 @@ void init(Boot::Info const& info) {
         queued = true;
     }
     invalidateAll();
+    mapReserved(dmar, length); // before anything is blocked
     for (usize i = 0; i < unitCount; i++)
         setCommand(units[i], TRANSLATION_ENABLE);
     log("[iommu] VT-d on (", unitCount, " unit(s), ", levels == 4 ? 48 : 39,
@@ -281,7 +343,7 @@ void init(Boot::Info const& info) {
     invalidateInterruptEntries();
     remapping = on;
     if (on)
-        log("[iommu] interrupt remapping on: devices can't send interrupt messages (all interrupts use the PIC)");
+        log("[iommu] interrupt remapping on: devices can't send interrupt messages (only the I/O APIC gets entries)");
     else
         log("[iommu] interrupt remapping didn't turn on (or lets compatibility-format messages through)");
 }

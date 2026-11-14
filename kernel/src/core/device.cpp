@@ -45,6 +45,8 @@ bool Irq::notify() {
     return true;
 }
 
+bool Irq::owned(u8 line) { return line < 16 and owners[line]; }
+
 bool Irq::deliver(u8 line) {
     Irq* irq = line < 16 ? owners[line] : nullptr;
     if (not irq)

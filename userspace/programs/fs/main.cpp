@@ -385,6 +385,7 @@ public:
         if (not disk.read(0, boot))
             return false;
         u64 end = disk.sectors(); // where the volume must stop
+        bool bhairavPartition = false; // a GPT partition of Bhairav's own type
         if (not isFat32(boot)) {
             if (get16(boot + 510) != 0xAA55)
                 return false;
@@ -401,12 +402,20 @@ public:
                     log("the disk's primary GPT header is damaged: using the backup");
                 }
                 end = _base + count;
+                bhairavPartition = true;
             } else {
                 // Maybe partitioned: try the first MBR partition.
                 _base = get32(boot + 446 + 8);
             }
             if (not _base or not disk.read(_base, boot) or not isFat32(boot))
                 return false;
+        }
+        // On a real machine the disk may be someone's own: a FAT32 volume is
+        // used only if it's Bhairav's (labelled BHAIRAV, as `make disk` and
+        // the disk image make it) or in a Bhairav data partition.
+        if (not bhairavPartition and memcmp(boot + 71, "BHAIRAV", 7) != 0) {
+            log("the FAT32 volume isn't Bhairav's (its label isn't BHAIRAV): left alone");
+            return false;
         }
 
         _sectorsPerCluster = boot[13];

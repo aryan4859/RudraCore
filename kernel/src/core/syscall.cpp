@@ -2,6 +2,7 @@
 
 #include "arch/x86_64/io.h"
 #include "arch/x86_64/acpi.h"
+#include "arch/x86_64/apic.h"
 #include "arch/x86_64/iommu.h"
 #include "arch/x86_64/pic.h"
 #include "arch/x86_64/protect.h"
@@ -990,6 +991,23 @@ Arch::Frame* sysFirmwarePci(Call const& c) {
     return c.result(Abi::OK);
 }
 
+// The acpi server's interrupt routing: PCI routes, then the switch to the APICs.
+Arch::Frame* sysFirmwareInterrupts(Call const& c) {
+    i64 error = 0;
+    if (not c.lookup<Core::Firmware>(c.arg0(), ObjectType::Firmware, Abi::RIGHT_WRITE, error))
+        return c.result(error);
+    if (c.arg1() == Abi::INTERRUPTS_ROUTE) {
+        Arch::Apic::Route route{static_cast<u32>(c.arg2()), static_cast<u8>(c.arg3() & 0xFF),
+                                bool(c.arg3() & (1 << 8)), bool(c.arg3() & (1 << 9))};
+        if (c.arg2() > 0xFFFF or (c.arg3() & 0xFF) > 0xFF or not Arch::Apic::addRoute(route))
+            return c.result(Abi::INVALID_ARGUMENT);
+        return c.result(Abi::OK);
+    }
+    if (c.arg1() == Abi::INTERRUPTS_APIC)
+        return c.result(Arch::Apic::enable() ? Abi::OK : Abi::IO_ERROR);
+    return c.result(Abi::INVALID_ARGUMENT);
+}
+
 // Turns the machine off or restarts it (ACPI). Not for apps.
 Arch::Frame* sysPower(Call const& c) {
     if (c.task->privilege == Core::Privilege::App)
@@ -1081,6 +1099,7 @@ Arch::Frame* dispatch(Arch::Frame* frame) {
     case Abi::SYS_FIRMWARE_PCI: return sysFirmwarePci(c);
     case Abi::SYS_PORT_IN_WIDE: return sysPortWide(c, false);
     case Abi::SYS_PORT_OUT_WIDE: return sysPortWide(c, true);
+    case Abi::SYS_FIRMWARE_INTERRUPTS: return sysFirmwareInterrupts(c);
 
     default: return c.result(Abi::UNKNOWN_SYSCALL);
     }

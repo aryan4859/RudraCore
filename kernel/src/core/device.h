@@ -30,6 +30,9 @@ struct Irq : public Object {
     // the line.
     static bool deliver(u8 line);
 
+    // Whether some Irq object already owns the line (one owner per line).
+    static bool owned(u8 line);
+
     // Sends the notification message if the line is bound. Returns false
     // if it couldn't be queued (it stays pending and is retried on ack).
     bool notify();

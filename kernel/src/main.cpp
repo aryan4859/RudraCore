@@ -208,7 +208,9 @@ void faultTest() {
                 // send on real VT-d, which blocks compatibility-format messages
                 // while GSTS.CFIS is clear. (QEMU doesn't model that block: there
                 // a compatibility-format message passes, so it can't be tested.)
-                Arch::Pci::write32(a, at + 4, 0xFEE00010);
+                // Handle 2: once the APICs are on, that entry is live (the timer's, GSI 2),
+                // so it's the requester-id check that must refuse the SATA controller.
+                Arch::Pci::write32(a, at + 4, 0xFEE00010 | 2 << 5);
                 if (wide)
                     Arch::Pci::write32(a, at + 8, 0);
                 Arch::Pci::write16(a, at + (wide ? 12 : 8), 0x0400); // delivery mode NMI
@@ -222,12 +224,33 @@ void faultTest() {
     }
 }
 
+// Whether an AHCI controller has a SATA disk (not just a CD drive) on a port:
+// a port whose link is up (SSTS.DET = 3) with the ATA disk signature.
+bool ahciHasDisk(Arch::Pci::Address a) {
+    Arch::Pci::Bar bar = Arch::Pci::readBar(a, 5);
+    if (not bar.address or bar.io)
+        return false;
+    u16 command = Arch::Pci::read16(a, 0x04);
+    if (not(command & 2))
+        Arch::Pci::write16(a, 0x04, static_cast<u16>(command | 2)); // memory decoding, to look
+    auto const* regs = static_cast<u32 const volatile*>(Arch::Acpi::map(bar.address, 0x1100, Vmm::Cache::Uncached));
+    u32 implemented = regs[0x0C / 4];
+    bool disk = false;
+    for (u32 p = 0; p < 32 and not disk; p++) {
+        if (not(implemented & (1u << p)))
+            continue;
+        u32 status = regs[(0x100 + p * 0x80 + 0x28) / 4], signature = regs[(0x100 + p * 0x80 + 0x24) / 4];
+        disk = (status & 0xF) == 3 and signature == 0x00000101;
+    }
+    return disk;
+}
+
 // Starts init, the root of userspace, and hands it the hardware: it decides
 // which driver gets what. The kernel itself never starts other programs.
 void startInit(Boot::Info const& info) {
-    Core::Object* handles[9] = {};
+    Core::Object* handles[11] = {};
     // init gets every right; it hands each driver only the ones it needs.
-    Core::Capability caps[9];
+    Core::Capability caps[11];
 
     if (info.hasFramebuffer) {
         auto const& fb = info.framebuffer;
@@ -240,15 +263,46 @@ void startInit(Boot::Info const& info) {
     handles[Abi::INIT_HANDLE_KEYBOARD_IRQ - 1] = new Core::Irq(1);
     handles[Abi::INIT_HANDLE_MOUSE_IRQ - 1] = new Core::Irq(12);
 
-    // The disk: the first AHCI (SATA) controller (PCI class 01, subclass 06,
-    // interface 01).
-    auto* storage = Core::PciDevice::find(0x01, 0x06, 0x01);
+    // The disk: an AHCI (SATA) controller with a disk on a port (machines
+    // often have an empty one, or one with only the CD drive), else an NVMe
+    // controller, else the legacy IDE controller (VirtualBox's default),
+    // whose primary channel's ports come along.
+    Core::PciDevice* storage = nullptr;
+    char const* kind = "";
+    {
+        Arch::Pci::Address ahci{}, nvme{}, ide{};
+        bool haveAhci = false, haveNvme = false, haveIde = false;
+        Arch::Pci::forEach([&](Arch::Pci::Address a) {
+            u32 classes = Arch::Pci::read32(a, 0x08) >> 8;
+            if (classes == 0x010601 and not haveAhci and ahciHasDisk(a)) {
+                ahci = a;
+                haveAhci = true;
+            } else if (classes == 0x010802 and not haveNvme) {
+                nvme = a;
+                haveNvme = true;
+            } else if ((classes >> 8) == 0x0101 and not haveIde) {
+                ide = a;
+                haveIde = true;
+            }
+        });
+        if (haveAhci) {
+            storage = new Core::PciDevice(ahci);
+            kind = "AHCI controller";
+        } else if (haveNvme) {
+            storage = new Core::PciDevice(nvme);
+            kind = "NVMe controller";
+        } else if (haveIde) {
+            storage = new Core::PciDevice(ide);
+            kind = "IDE controller";
+            handles[Abi::INIT_HANDLE_STORAGE_PORTS - 1] = new Core::IoPorts(0x1F0, 8); // primary channel
+        }
+    }
     handles[Abi::INIT_HANDLE_STORAGE - 1] = storage;
     if (storage)
-        log("[pci]  storage     AHCI controller ", Hex{storage->vendor, 4}, ":", Hex{storage->device, 4},
-            " at ", storage->address.bus, ":", storage->address.device, ".", storage->address.function);
+        log("[pci]  storage     ", kind, " ", Hex{storage->vendor, 4}, ":", Hex{storage->device, 4}, " at ",
+            storage->address.bus, ":", storage->address.device, ".", storage->address.function);
     else
-        log("[pci]  storage     no AHCI controller");
+        log("[pci]  storage     no disk controller with a disk (AHCI, NVMe or IDE)");
 
     // The network card: an Intel e1000 (82540EM, QEMU's default and common
     // in virtual machines, and relatives) or a Realtek RTL8139, plus its
@@ -279,11 +333,18 @@ void startInit(Boot::Info const& info) {
     if (info.acpiRsdp) {
         handles[Abi::INIT_HANDLE_FIRMWARE - 1] = new Core::Firmware();
         handles[Abi::INIT_HANDLE_FIRMWARE_PORTS - 1] = new Core::IoPorts(0, 0xFFFF, true);
+        // The SCI (ACPI events), level-triggered, if no driver's line shares it.
+        auto const& fadt = Arch::Acpi::info().fadt;
+        u16 sci = fadt.present ? fadt.sciInterrupt : 0;
+        if (sci > 2 and sci < 16 and sci != 8 and sci != 12 and sci != 13 and not Core::Irq::owned(static_cast<u8>(sci))) {
+            Arch::Pic::setLevelTriggered(static_cast<u8>(sci));
+            handles[Abi::INIT_HANDLE_SCI - 1] = new Core::Irq(static_cast<u8>(sci));
+        }
     }
 
-    for (usize i = 0; i < 9; i++)
+    for (usize i = 0; i < 11; i++)
         caps[i] = {handles[i], Abi::RIGHTS_ALL, 0};
-    Core::Task* init = Programs::start("init", 4, caps, 9, code, error);
+    Core::Task* init = Programs::start("init", 4, caps, 11, code, error);
     if (not init)
         panic("can't start init: is init.elf in the boot image?");
     init->privilege = Core::Privilege::Root;

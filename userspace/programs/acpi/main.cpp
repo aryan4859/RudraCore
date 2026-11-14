@@ -6,19 +6,32 @@
 // Handles from init:
 //   1: firmware (non-RAM physical memory, PCI configuration)
 //   2: firmware I/O ports
+//   3: a channel to KamalShell (protocol/power.h: battery, AC, temperature)
+//   4: the SCI interrupt (ACPI events), when it has a line of its own
 //
 // Today it loads the namespace and reports what the AML says: \_S5 (the
 // soft-off sleep type, evaluated rather than pattern-matched), the PCI root
 // bridge's _PRT (interrupt routing), and the battery, AC adapter, power
-// button and thermal zone devices. Next: APIC routing, events (SCI),
-// battery and thermal readings, sleep.
+// button and thermal zone devices. Then it moves the machine to the APICs:
+// \_PIC(1), every PCI interrupt resolved through _PRT, the kernel told.
+// Events: the SCI runs uACPI's event handling (fixed events, GPEs); the
+// power button turns the machine off. Battery, AC adapter and thermal zone
+// readings (_BIX/_BIF, _BST, _PSR, _TMP, _CRT), through an embedded
+// controller driver where the AML needs one. Next: sleep states.
 
+#include <kapala/channel.h>
 #include <kapala/heap.h>
+#include <kapala/protocol/power.h>
 #include <kapala/sys.h>
 #include <kapala/text.h>
 
 #include <uacpi/kernel_api.h>
+#include <uacpi/event.h>
 #include <uacpi/namespace.h>
+#include <uacpi/notify.h>
+#include <uacpi/opregion.h>
+#include <uacpi/resources.h>
+#include <uacpi/sleep.h>
 #include <uacpi/uacpi.h>
 #include <uacpi/utilities.h>
 
@@ -28,6 +41,33 @@ namespace {
 
 constexpr Sys::Handle FIRMWARE = 1;
 constexpr Sys::Handle PORTS = 2;
+constexpr Sys::Handle SHELL = 3;
+constexpr Sys::Handle SCI = 4;
+
+namespace Power = Protocol::Power;
+
+// The SCI handler uACPI installs, and its context.
+uacpi_interrupt_handler sciHandler = nullptr;
+uacpi_handle sciContext = nullptr;
+unsigned powerButtonPresses = 0;
+bool powerButton = false; // pressed, not yet acted on
+
+struct Work {
+    uacpi_work_handler handler;
+    uacpi_handle context;
+};
+Work work[32];
+unsigned long workCount = 0;
+
+void runWork() {
+    while (workCount) {
+        Work w = work[0];
+        for (unsigned long i = 1; i < workCount; i++)
+            work[i - 1] = work[i];
+        workCount--;
+        w.handler(w.context); // (may queue more)
+    }
+}
 constexpr unsigned long PAGE = 4096;
 
 // MARK: Mappings (cached: a program may hold only 32, and uACPI maps often)
@@ -171,6 +211,323 @@ void report() {
     d.add("devices: ").add(devices("PNP0C0A")).add(" battery, ").add(devices("ACPI0003")).add(" AC adapter, ")
         .add(devices("PNP0C0C")).add(" power button, ").add(thermal.n).add(" thermal zone(s)");
     Sys::log(d.cstr());
+}
+
+// MARK: Interrupt routing: the PICs -> the APICs
+
+struct Link {
+    unsigned long gsi = 0;
+    bool level = true, activeLow = true, found = false; // (PCI's defaults)
+};
+
+uacpi_iteration_decision linkIrq(void* user, uacpi_resource* r) {
+    auto* link = static_cast<Link*>(user);
+    if (r->type == UACPI_RESOURCE_TYPE_EXTENDED_IRQ and r->extended_irq.num_irqs) {
+        *link = {r->extended_irq.irqs[0], r->extended_irq.triggering == UACPI_TRIGGERING_LEVEL,
+                 r->extended_irq.polarity == UACPI_POLARITY_ACTIVE_LOW, true};
+        return UACPI_ITERATION_DECISION_BREAK;
+    }
+    if (r->type == UACPI_RESOURCE_TYPE_IRQ and r->irq.num_irqs) {
+        *link = {r->irq.irqs[0], r->irq.triggering == UACPI_TRIGGERING_LEVEL,
+                 r->irq.polarity == UACPI_POLARITY_ACTIVE_LOW, true};
+        return UACPI_ITERATION_DECISION_BREAK;
+    }
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+unsigned long pci(unsigned bus, unsigned device, unsigned function, unsigned offset, unsigned width) {
+    long v = Sys::firmwarePciRead(FIRMWARE, bus << 16 | device << 11 | function << 8 | offset, width);
+    return v < 0 ? ~0ul : static_cast<unsigned long>(v);
+}
+
+// Tells the firmware we use the I/O APIC (\_PIC(1)), works out where each
+// PCI function's interrupt pin arrives (_PRT, through link devices' _CRS),
+// hands those routes to the kernel and asks it to switch. Bus 0 only.
+void routeInterrupts() {
+    if (uacpi_set_interrupt_model(UACPI_INTERRUPT_MODEL_IOAPIC) != UACPI_STATUS_OK) {
+        Sys::log("acpi: \\_PIC(1) failed: staying on the 8259 PICs");
+        return;
+    }
+    uacpi_namespace_node* root = nullptr;
+    uacpi_find_devices("PNP0A08", firstNode, &root);
+    if (not root)
+        uacpi_find_devices("PNP0A03", firstNode, &root);
+    uacpi_pci_routing_table* table = nullptr;
+    if (not root or uacpi_get_pci_routing_table(root, &table) != UACPI_STATUS_OK) {
+        Sys::log("acpi: no _PRT for the PCI root: staying on the 8259 PICs");
+        return;
+    }
+    unsigned long routed = 0;
+    bool failed = false;
+    for (unsigned device = 0; device < 32 and not failed; device++) {
+        bool multifunction = pci(0, device, 0, 0x0E, 1) & 0x80;
+        for (unsigned function = 0; function < (multifunction ? 8u : 1u) and not failed; function++) {
+            if ((pci(0, device, function, 0, 2) & 0xFFFF) == 0xFFFF)
+                continue;
+            unsigned long pin = pci(0, device, function, 0x3D, 1), line = pci(0, device, function, 0x3C, 1);
+            if (pin < 1 or pin > 4 or line >= 16)
+                continue; // no interrupt, or none the firmware gave a line
+            Link link;
+            for (uacpi_size i = 0; i < table->num_entries and not link.found; i++) {
+                auto const& e = table->entries[i];
+                if ((e.address >> 16) != device or e.pin != pin - 1)
+                    continue;
+                if (e.source) {
+                    uacpi_resources* resources = nullptr;
+                    if (uacpi_get_current_resources(e.source, &resources) == UACPI_STATUS_OK) {
+                        uacpi_for_each_resource(resources, linkIrq, &link);
+                        uacpi_free_resources(resources);
+                    }
+                } else {
+                    link = {e.index, true, true, true};
+                }
+            }
+            long r = link.found ? Sys::firmwareInterrupts(FIRMWARE, Sys::INTERRUPTS_ROUTE, link.gsi,
+                                                          line | (link.level ? 1ul << 8 : 0) | (link.activeLow ? 1ul << 9 : 0))
+                                : -1;
+            if (r < 0) {
+                Text<120> t;
+                t.add("acpi: PCI 0:").add(static_cast<unsigned long>(device)).add(".").add(static_cast<unsigned long>(function))
+                    .add(" pin ").add(pin).add(": no route: staying on the 8259 PICs");
+                Sys::log(t.cstr());
+                failed = true;
+            }
+            routed++;
+        }
+    }
+    uacpi_free_pci_routing_table(table);
+    if (failed)
+        return;
+    long r = Sys::firmwareInterrupts(FIRMWARE, Sys::INTERRUPTS_APIC);
+    Text<120> t;
+    t.add("acpi: ").add(routed).add(" PCI interrupt(s) routed by _PRT; ")
+        .add(r == Sys::OK ? "the kernel switched to the APICs" : "the kernel stayed on the 8259 PICs");
+    Sys::log(t.cstr());
+}
+
+// MARK: Events
+
+uacpi_interrupt_ret onPowerButton(uacpi_handle) {
+    powerButton = true;
+    return UACPI_INTERRUPT_HANDLED;
+}
+
+// A power button that's a device (PNP0C0C) signals with Notify(0x80).
+uacpi_status onButtonNotify(uacpi_handle, uacpi_namespace_node*, uacpi_u64 value) {
+    if (value == 0x80)
+        powerButton = true;
+    return UACPI_STATUS_OK;
+}
+
+uacpi_iteration_decision watchButton(void*, uacpi_namespace_node* node, uacpi_u32) {
+    uacpi_install_notify_handler(node, onButtonNotify, nullptr);
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+// MARK: Embedded controller (ACPI 6.5 section 12): two ports, a byte protocol
+
+struct Ec {
+    unsigned data = 0, command = 0;
+    int ports = 0;
+} ec;
+
+constexpr unsigned EC_OBF = 1, EC_IBF = 2, EC_READ = 0x80, EC_WRITE = 0x81;
+
+bool ecWait(bool outputFull) {
+    for (int i = 0; i < 100000; i++) {
+        long status = Sys::portInWide(PORTS, ec.command, 1);
+        if (status < 0)
+            return false;
+        if (outputFull ? (status & EC_OBF) : not(status & EC_IBF))
+            return true;
+    }
+    return false; // (a stuck controller: the AML gets an error, nothing hangs)
+}
+
+uacpi_status ecHandler(uacpi_region_op op, uacpi_handle data) {
+    if (op == UACPI_REGION_OP_ATTACH or op == UACPI_REGION_OP_DETACH)
+        return UACPI_STATUS_OK;
+    if (op != UACPI_REGION_OP_READ and op != UACPI_REGION_OP_WRITE)
+        return UACPI_STATUS_UNIMPLEMENTED;
+    auto* rw = static_cast<uacpi_region_rw_data*>(data);
+    if (rw->byte_width != 1 or rw->offset > 0xFF)
+        return UACPI_STATUS_INVALID_ARGUMENT;
+    bool read = op == UACPI_REGION_OP_READ;
+    if (not ecWait(false) or Sys::portOutWide(PORTS, ec.command, 1, read ? EC_READ : EC_WRITE) < 0 or
+        not ecWait(false) or Sys::portOutWide(PORTS, ec.data, 1, rw->offset) < 0)
+        return UACPI_STATUS_HARDWARE_TIMEOUT;
+    if (read) {
+        if (not ecWait(true))
+            return UACPI_STATUS_HARDWARE_TIMEOUT;
+        rw->value = static_cast<unsigned long>(Sys::portInWide(PORTS, ec.data, 1)) & 0xFF;
+    } else if (not ecWait(false) or Sys::portOutWide(PORTS, ec.data, 1, rw->value & 0xFF) < 0) {
+        return UACPI_STATUS_HARDWARE_TIMEOUT;
+    }
+    return UACPI_STATUS_OK;
+}
+
+uacpi_iteration_decision ecPort(void*, uacpi_resource* r) {
+    unsigned port = r->type == UACPI_RESOURCE_TYPE_IO         ? r->io.minimum
+                    : r->type == UACPI_RESOURCE_TYPE_FIXED_IO ? r->fixed_io.address
+                                                              : 0x10000;
+    if (port <= 0xFFFF) {
+        if (ec.ports == 0)
+            ec.data = port; // the data port comes first
+        else
+            ec.command = port;
+        if (++ec.ports == 2)
+            return UACPI_ITERATION_DECISION_BREAK;
+    }
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+uacpi_iteration_decision setUpEc(void*, uacpi_namespace_node* node, uacpi_u32) {
+    uacpi_resources* resources = nullptr;
+    if (uacpi_get_current_resources(node, &resources) != UACPI_STATUS_OK)
+        return UACPI_ITERATION_DECISION_CONTINUE;
+    uacpi_for_each_resource(resources, ecPort, nullptr);
+    uacpi_free_resources(resources);
+    if (ec.ports == 2 and uacpi_install_address_space_handler(node, UACPI_ADDRESS_SPACE_EMBEDDED_CONTROLLER,
+                                                              ecHandler, nullptr) == UACPI_STATUS_OK) {
+        Text<100> t;
+        t.add("acpi: embedded controller at ports ").add(static_cast<unsigned long>(ec.data)).add("/")
+            .add(static_cast<unsigned long>(ec.command));
+        Sys::log(t.cstr());
+    }
+    return UACPI_ITERATION_DECISION_BREAK; // (one EC)
+}
+
+// MARK: Batteries, AC adapter, thermal zones
+
+constexpr unsigned long UNKNOWN = 0xFFFFFFFF; // ACPI's "unknown" in battery packages
+
+// Integers of a package a method returns (unknown or missing: UNKNOWN).
+bool packageIntegers(uacpi_namespace_node* node, char const* method, unsigned long* out, unsigned long count) {
+    uacpi_object* object = nullptr;
+    uacpi_object_array items{};
+    if (uacpi_eval_simple_package(node, method, &object) != UACPI_STATUS_OK or
+        uacpi_object_get_package(object, &items) != UACPI_STATUS_OK) {
+        uacpi_object_unref(object);
+        return false;
+    }
+    for (unsigned long i = 0; i < count; i++) {
+        uacpi_u64 v = UNKNOWN;
+        if (i >= items.count or uacpi_object_get_integer(items.objects[i], &v) != UACPI_STATUS_OK)
+            v = UNKNOWN;
+        out[i] = v;
+    }
+    uacpi_object_unref(object);
+    return true;
+}
+
+struct Totals {
+    unsigned long remaining = 0, full = 0;
+    Power::Status* status = nullptr;
+};
+
+uacpi_iteration_decision readBattery(void* user, uacpi_namespace_node* node, uacpi_u32) {
+    auto* totals = static_cast<Totals*>(user);
+    totals->status->batteries++;
+    // Last full charge: _BIX field 3, or _BIF field 2. Now: _BST.
+    unsigned long info[4], state[4];
+    unsigned long full = UNKNOWN;
+    if (packageIntegers(node, "_BIX", info, 4))
+        full = info[3];
+    else if (packageIntegers(node, "_BIF", info, 3))
+        full = info[2];
+    if (not packageIntegers(node, "_BST", state, 4))
+        return UACPI_ITERATION_DECISION_CONTINUE;
+    totals->status->discharging |= state[0] & 1;
+    totals->status->charging |= (state[0] >> 1) & 1;
+    totals->status->critical |= (state[0] >> 2) & 1;
+    if (full != UNKNOWN and full and state[2] != UNKNOWN) {
+        totals->full += full;
+        totals->remaining += state[2] < full ? state[2] : full;
+    }
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+uacpi_iteration_decision readAdapter(void* user, uacpi_namespace_node* node, uacpi_u32) {
+    auto* status = static_cast<Power::Status*>(user);
+    uacpi_u64 online = 0;
+    if (uacpi_eval_simple_integer(node, "_PSR", &online) == UACPI_STATUS_OK and status->ac != 1)
+        status->ac = online ? 1 : 0; // (several adapters: online if any is)
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+uacpi_iteration_decision readZone(void* user, uacpi_namespace_node* node, uacpi_u32) {
+    auto* status = static_cast<Power::Status*>(user);
+    status->thermalZones++;
+    uacpi_u64 kelvin = 0, critical = 0; // tenths of a kelvin
+    if (uacpi_eval_simple_integer(node, "_TMP", &kelvin) == UACPI_STATUS_OK and kelvin >= 1000 and kelvin < 6000) {
+        auto celsius = static_cast<short>(static_cast<long>(kelvin) - 2732);
+        if (status->temperature == Power::UNKNOWN_TEMPERATURE or celsius > status->temperature) {
+            status->temperature = celsius;
+            bool haveCritical = uacpi_eval_simple_integer(node, "_CRT", &critical) == UACPI_STATUS_OK and
+                                critical >= 1000 and critical < 6000;
+            status->criticalTemperature = haveCritical ? static_cast<short>(static_cast<long>(critical) - 2732)
+                                                       : Power::UNKNOWN_TEMPERATURE;
+        }
+    }
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+Power::Status readStatus() {
+    Power::Status status{};
+    status.percent = Power::UNKNOWN_PERCENT;
+    status.ac = -1;
+    status.temperature = status.criticalTemperature = Power::UNKNOWN_TEMPERATURE;
+    status.powerButtonPresses = powerButtonPresses;
+    Totals totals;
+    totals.status = &status;
+    uacpi_find_devices("PNP0C0A", readBattery, &totals);
+    if (totals.full)
+        status.percent = static_cast<unsigned char>(totals.remaining * 100 / totals.full);
+    uacpi_find_devices("ACPI0003", readAdapter, &status);
+    uacpi_namespace_for_each_child(uacpi_namespace_root(), readZone, nullptr, UACPI_OBJECT_THERMAL_ZONE_BIT,
+                                   UACPI_MAX_DEPTH_ANY, &status);
+    return status;
+}
+
+// Off, the ACPI way: \_PTS(5) and \_GTS (uACPI's preparation), then
+// SLP_TYP|SLP_EN. If the firmware won't, the kernel's own S5 is the fallback.
+void powerOff(char const* why) {
+    Text<120> t;
+    t.add("acpi: ").add(why).add(": turning off through ACPI (S5)");
+    Sys::log(t.cstr());
+    uacpi_status s = uacpi_prepare_for_sleep_state(UACPI_SLEEP_STATE_S5);
+    if (s == UACPI_STATUS_OK)
+        s = uacpi_enter_sleep_state(UACPI_SLEEP_STATE_S5);
+    Text<120> e;
+    e.add("acpi: ACPI couldn't turn the machine off (").add(uacpi_status_to_string(s)).add("): the kernel tries");
+    Sys::log(e.cstr());
+    Sys::power(Sys::POWER_OFF);
+}
+
+void logStatus() {
+    Power::Status s = readStatus();
+    Text<200> t;
+    t.add("acpi: power: ");
+    if (s.batteries) {
+        t.add(static_cast<unsigned long>(s.batteries)).add(" battery, ");
+        if (s.percent != Power::UNKNOWN_PERCENT)
+            t.add(static_cast<unsigned long>(s.percent)).add("%");
+        else
+            t.add("charge unknown");
+        t.add(s.charging ? " charging" : s.discharging ? " discharging" : "").add(s.critical ? " (critical)" : "");
+    } else {
+        t.add("no battery");
+    }
+    t.add(s.ac == 1 ? ", on AC" : s.ac == 0 ? ", AC unplugged" : "");
+    if (s.temperature != Power::UNKNOWN_TEMPERATURE) {
+        t.add(", ").add(static_cast<long>(s.temperature / 10)).add(".").add(static_cast<long>((s.temperature % 10 + 10) % 10))
+            .add(" C");
+        if (s.criticalTemperature != Power::UNKNOWN_TEMPERATURE)
+            t.add(" (critical at ").add(static_cast<long>(s.criticalTemperature / 10)).add(" C)");
+    } else {
+        t.add(", no temperature reading");
+    }
+    Sys::log(t.cstr());
 }
 
 } // namespace
@@ -363,24 +720,33 @@ uacpi_status uacpi_kernel_handle_firmware_request(uacpi_firmware_request* reques
     return UACPI_STATUS_OK;
 }
 
-// shortcut: the SCI isn't wired up yet (events come with the next step);
-// the handler is accepted and never called.
-uacpi_status uacpi_kernel_install_interrupt_handler(uacpi_u32, uacpi_interrupt_handler, uacpi_handle,
+// The SCI: main() binds it to a channel and calls the handler from the loop.
+uacpi_status uacpi_kernel_install_interrupt_handler(uacpi_u32, uacpi_interrupt_handler handler, uacpi_handle context,
                                                     uacpi_handle* out) {
+    sciHandler = handler;
+    sciContext = context;
     *out = reinterpret_cast<uacpi_handle>(1);
     return UACPI_STATUS_OK;
 }
 uacpi_status uacpi_kernel_uninstall_interrupt_handler(uacpi_interrupt_handler, uacpi_handle) {
+    sciHandler = nullptr;
     return UACPI_STATUS_OK;
 }
 
-// Work runs at once: there's no second thread to hand it to.
+// Work (GPE methods, notifications) is queued and run by the main loop once
+// the handler that queued it has returned: never inside it.
 uacpi_handle uacpi_kernel_create_work_item(void) { return Heap::alloc(1); }
 void uacpi_kernel_free_work_item(uacpi_handle w) { Heap::free(w); }
 void uacpi_kernel_schedule_work(uacpi_work_type, uacpi_handle, uacpi_work_handler handler, uacpi_handle context) {
-    handler(context);
+    if (workCount < sizeof(work) / sizeof(work[0]))
+        work[workCount++] = {handler, context};
+    else
+        Sys::log("acpi: too much ACPI work queued: dropped some");
 }
-uacpi_status uacpi_kernel_wait_for_work_completion(void) { return UACPI_STATUS_OK; }
+uacpi_status uacpi_kernel_wait_for_work_completion(void) {
+    runWork();
+    return UACPI_STATUS_OK;
+}
 
 } // extern "C"
 
@@ -407,6 +773,59 @@ int main() {
         return 1;
     }
     report();
-    for (;;)
-        Sys::sleep(60 * 1000);
+    routeInterrupts();
+
+    // Events: the EC first (battery methods often read it), then the power
+    // button, then the GPEs the AML has handlers for.
+    uacpi_find_devices("PNP0C09", setUpEc, nullptr);
+    if (uacpi_install_fixed_event_handler(UACPI_FIXED_EVENT_POWER_BUTTON, onPowerButton, nullptr) != UACPI_STATUS_OK)
+        Sys::log("acpi: no fixed power button");
+    uacpi_find_devices("PNP0C0C", watchButton, nullptr);
+    uacpi_finalize_gpe_initialization();
+    Channel sci, sciEnd;
+    Channel::createPair(sci, sciEnd);
+    bool haveSci = Sys::irqBind(SCI, sciEnd.handle(), 1) == Sys::OK;
+    Sys::log(haveSci ? "acpi: listening for ACPI events (SCI)" : "acpi: no SCI line of its own: no ACPI events");
+    logStatus();
+
+    Channel shell(SHELL);
+    bool haveShell = true;
+    for (;;) {
+        Sys::Handle handles[2];
+        int owners[2];
+        unsigned long count = 0;
+        if (haveShell) {
+            handles[count] = shell.handle();
+            owners[count++] = 0;
+        }
+        if (haveSci) {
+            handles[count] = sci.handle();
+            owners[count++] = 1;
+        }
+        long ready = count ? Sys::wait(handles, count, Sys::WAIT_FOREVER) : Sys::TIMED_OUT;
+        if (count == 0)
+            Sys::sleep(60 * 1000);
+        if (ready >= 0 and owners[ready] == 1) { // the SCI: uACPI reads and clears what happened
+            Sys::IrqMessage message;
+            sci.recv(message);
+            if (sciHandler)
+                sciHandler(sciContext);
+            Sys::irqAck(SCI);
+            runWork();
+        } else if (ready >= 0) {
+            Power::Request request{};
+            long r = shell.recv(request);
+            if (r == Sys::PEER_CLOSED)
+                haveShell = false; // (no shell: events only)
+            else if (r == Sys::OK and request.op == Power::Op::Status)
+                shell.send(readStatus());
+            else if (r == Sys::OK and request.op == Power::Op::PowerOff)
+                powerOff("shut down from KamalShell");
+        }
+        if (powerButton) {
+            powerButtonPresses++;
+            powerButton = false;
+            powerOff("power button pressed");
+        }
+    }
 }

@@ -157,7 +157,7 @@ QEMU_FLAGS := -M q35 -m 256M -cdrom $(ISO) -boot d \
 	-drive file=$(DISK),format=raw,if=none,id=disk -device ide-hd,drive=disk,bus=ide.0 \
 	-netdev user,id=net -device $(NIC),netdev=net
 
-.PHONY: all kernel user shool iso disk disk-image packages repo serve-repo install-app run run-uefi run-secureboot \
+.PHONY: all kernel user shool iso disk disk-image vm-images packages repo serve-repo install-app run run-uefi run-secureboot \
 	secure-boot-vars tls-negative shot clean FORCE
 
 all: iso $(DISK)
@@ -478,6 +478,19 @@ $(DISK_IMAGE): $(ISO) assets/welcome.txt
 tls-negative: $(ISO) $(DISK) $(BPK) $(SERVE)
 	sh scripts/tls-negative.sh $(ISO) $(BUILD) $(DISK)
 
+# The disk image for virtual machines (docs/HARDWARE.md): VirtualBox (.vdi)
+# and VMware (.vmdk). Attach it as the VM's disk: it boots (UEFI or BIOS)
+# and holds the files.
+vm-images: $(BUILD)/bhairavos.vdi $(BUILD)/bhairavos.vmdk
+
+$(BUILD)/bhairavos.vdi: $(DISK_IMAGE)
+	rm -f $@
+	qemu-img convert -f raw -O vdi $< $@
+
+$(BUILD)/bhairavos.vmdk: $(DISK_IMAGE)
+	rm -f $@
+	qemu-img convert -f raw -O vmdk -o subformat=monolithicSparse $< $@
+
 # Serial console in the terminal (no window). Quit with Ctrl+A then X.
 run: $(ISO) $(DISK)
 	qemu-system-x86_64 $(QEMU_FLAGS) -nographic
@@ -494,8 +507,15 @@ run-secureboot: $(ISO) $(DISK) $(BUILD)/ovmf-vars-secureboot.fd
 
 # Boots headless, saves the screen to build/screen.png and the serial log to
 # build/serial.log. Set FIRMWARE=uefi to boot through UEFI instead of BIOS.
-shot: $(ISO) $(DISK)
-	NIC=$(NIC) sh scripts/screenshot.sh $(ISO) $(BUILD) $(DISK) $(if $(filter uefi,$(FIRMWARE)),$(OVMF))
+shot: $(ISO) $(DISK) $(if $(ACPI_TEST),$(BUILD)/acpi-test.aml)
+	NIC=$(NIC) $(if $(ACPI_TEST),ACPI_TABLE=$(BUILD)/acpi-test.aml) sh scripts/screenshot.sh $(ISO) $(BUILD) $(DISK) \
+		$(if $(filter uefi,$(FIRMWARE)),$(OVMF))
+
+# A test SSDT with a battery, an AC adapter and a thermal zone (QEMU has
+# none): `make shot ACPI_TEST=1`.
+$(BUILD)/acpi-test.aml: scripts/acpi-test.asl
+	@mkdir -p $(@D)
+	iasl -p $(basename $@) $< >/dev/null
 
 clean:
 	rm -rf $(BUILD)

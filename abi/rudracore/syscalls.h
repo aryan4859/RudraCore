@@ -117,7 +117,14 @@ enum Syscall : unsigned long {
     SYS_FIRMWARE_PCI = 40,
     SYS_PORT_IN_WIDE = 41,
     SYS_PORT_OUT_WIDE = 42,
+    SYS_FIRMWARE_INTERRUPTS = 43, // (Handle firmware, u64 action, u64 a, u64 b), RIGHT_WRITE:
+                                  //   INTERRUPTS_ROUTE: a = GSI, b = line | level << 8 | activeLow << 9
+                                  //     (a PCI device's interrupt, as _PRT routes it in APIC mode);
+                                  //   INTERRUPTS_APIC: switch from the 8259 PICs to the APICs.
+                                  //   IO_ERROR if that couldn't be done (still on the PICs).
 };
+
+constexpr unsigned long INTERRUPTS_ROUTE = 1, INTERRUPTS_APIC = 2;
 
 constexpr unsigned long POWER_OFF = 1, POWER_RESTART = 2;
 constexpr unsigned long PCI_WRITE = 0x100;
@@ -201,11 +208,13 @@ enum InitHandle : Handle {
     INIT_HANDLE_PS2_PORTS = 2,   // I/O ports 0x60-0x64 (PS/2 controller)
     INIT_HANDLE_KEYBOARD_IRQ = 3,
     INIT_HANDLE_MOUSE_IRQ = 4,
-    INIT_HANDLE_STORAGE = 5,     // PCI device: the AHCI (SATA) disk controller
+    INIT_HANDLE_STORAGE = 5,     // PCI device: the disk controller (AHCI with a disk, else NVMe, else IDE)
     INIT_HANDLE_NETWORK = 6,     // PCI device: the network card (Intel e1000 family)
     INIT_HANDLE_NETWORK_IRQ = 7, // its interrupt line
     INIT_HANDLE_FIRMWARE = 8,       // ACPI: non-RAM physical memory and PCI configuration
     INIT_HANDLE_FIRMWARE_PORTS = 9, // ACPI: I/O ports, except those the kernel and drivers own
+    INIT_HANDLE_SCI = 10,           // ACPI: the SCI interrupt (events: power button, GPEs), if it has a line of its own
+    INIT_HANDLE_STORAGE_PORTS = 11, // IDE only: the primary channel's ports, 0x1F0-0x1F7
 };
 
 struct SystemInfo {

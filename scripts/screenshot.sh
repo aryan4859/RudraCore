@@ -13,6 +13,7 @@
 #   IOMMU=1       add an Intel VT-d IOMMU (DMA and interrupt remapping);
 #                 IOMMU=dma-only leaves interrupt remapping out
 #   STEP=0.3      seconds between MONITOR commands (lower it for double clicks)
+#   ACPI_TABLE=build/acpi-test.aml  an extra ACPI table (the test battery and thermal zone)
 #   REPO=build/repo  serve this folder on port 8080 meanwhile (apt tests)
 set -eu
 
@@ -46,6 +47,9 @@ set -- -M q35 -m "$MEMORY" $IOMMU_DEVICE -cdrom "$ISO" -boot d \
     -drive "file=$DISK,format=raw,if=none,id=disk" -device ide-hd,drive=disk,bus=ide.0 \
     -netdev user,id=net -device "${NIC:-e1000},netdev=net" \
     -display none -serial "file:$OUT/serial.log" -monitor stdio
+if [ -n "${ACPI_TABLE:-}" ]; then
+    set -- "$@" -acpitable "file=$ACPI_TABLE"
+fi
 if [ -n "${CPU:-}" ]; then
     set -- "$@" -cpu "$CPU"
 fi

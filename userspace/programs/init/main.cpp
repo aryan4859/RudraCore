@@ -86,8 +86,19 @@ void checkIpc() {
 Channel startStorage() {
     Channel diskClient, diskDriver;
     Channel::createPair(diskClient, diskDriver);
-    Sys::Handle ahci[] = {Sys::INIT_HANDLE_STORAGE, diskDriver.handle()};
-    if (Sys::spawn("ahci", ahci, 2) >= 0)
+    // The driver for the controller the kernel chose: AHCI (SATA), NVMe, or
+    // IDE (which works through the primary channel's I/O ports).
+    Sys::DeviceInfo controller{};
+    bool have = Sys::deviceInfo(Sys::INIT_HANDLE_STORAGE, controller) == Sys::OK;
+    long spawned = -1;
+    if (have and controller.subclass == 0x01) {
+        Sys::Handle ata[] = {Sys::INIT_HANDLE_STORAGE_PORTS, diskDriver.handle()};
+        spawned = Sys::spawn("ata", ata, 2);
+    } else if (have) {
+        Sys::Handle give[] = {Sys::INIT_HANDLE_STORAGE, diskDriver.handle()};
+        spawned = Sys::spawn(controller.subclass == 0x08 ? "nvme" : "ahci", give, 2);
+    }
+    if (spawned >= 0)
         diskDriver.release(); // moved to the driver
     else
         Sys::log("no disk controller: files are unavailable");
@@ -181,6 +192,7 @@ void spawnConnected(char const* program, Channel& connect, ConnectMessage const 
 void limitDevices() {
     constexpr unsigned long PCI = Sys::RIGHT_READ | Sys::RIGHT_MMIO | Sys::RIGHT_DMA;
     Sys::restrictRights(Sys::INIT_HANDLE_STORAGE, PCI);
+    Sys::restrictRights(Sys::INIT_HANDLE_STORAGE_PORTS, Sys::RIGHT_READ | Sys::RIGHT_WRITE);
     Sys::restrictRights(Sys::INIT_HANDLE_NETWORK, PCI);
     Sys::restrictRights(Sys::INIT_HANDLE_NETWORK_IRQ, Sys::RIGHT_READ);
     Sys::restrictRights(Sys::INIT_HANDLE_PS2_PORTS, Sys::RIGHT_READ | Sys::RIGHT_WRITE);
@@ -230,13 +242,22 @@ int main() {
 
     // The ACPI server runs the firmware's AML, with only firmware handles
     // (never in safe mode: it's firmware code, and safe mode is the minimum).
+    // It answers KamalShell's power questions (battery, temperature) over
+    // `power`; without it, the shell's end just finds the channel closed.
+    Channel power, powerShell;
+    Channel::createPair(power, powerShell);
     if (info.bootMode != Sys::BOOT_SAFE) {
         Sys::restrictRights(Sys::INIT_HANDLE_FIRMWARE, Sys::RIGHT_READ | Sys::RIGHT_WRITE);
         Sys::restrictRights(Sys::INIT_HANDLE_FIRMWARE_PORTS, Sys::RIGHT_READ | Sys::RIGHT_WRITE);
-        Sys::Handle acpi[] = {Sys::INIT_HANDLE_FIRMWARE, Sys::INIT_HANDLE_FIRMWARE_PORTS};
-        if (Sys::spawn("acpi", acpi, 2) < 0)
+        bool sci = Sys::restrictRights(Sys::INIT_HANDLE_SCI, Sys::RIGHT_READ) == Sys::OK;
+        Sys::Handle acpi[] = {Sys::INIT_HANDLE_FIRMWARE, Sys::INIT_HANDLE_FIRMWARE_PORTS, power.handle(),
+                              Sys::INIT_HANDLE_SCI};
+        if (Sys::spawn("acpi", acpi, sci ? 4 : 3) >= 0)
+            power.release(); // moved to the server
+        else
             Sys::log("no ACPI server (no ACPI tables, or acpi.elf is missing)");
     }
+    power = Channel();
 
     Channel files = startStorage();
     // fs-test also checks the scopes: one connection of each kind.
@@ -282,8 +303,9 @@ int main() {
     // Leave the boot screen up for a moment, then hand the screen, the
     // input, files and the network to KamalShell, which starts the apps.
     Sys::sleep(1500);
-    Sys::Handle shell[] = {Sys::INIT_HANDLE_FRAMEBUFFER, input.release(), files.release(), network.release()};
-    if (Sys::spawn("kamalshell", shell, 4) < 0)
+    Sys::Handle shell[] = {Sys::INIT_HANDLE_FRAMEBUFFER, input.release(), files.release(), network.release(),
+                           powerShell.release()};
+    if (Sys::spawn("kamalshell", shell, 5) < 0)
         Sys::log("can't start KamalShell");
 
     for (;;)

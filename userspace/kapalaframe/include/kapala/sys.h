@@ -187,6 +187,10 @@ inline long portOutWide(Handle ports, unsigned port, unsigned width, unsigned lo
     return syscall(SYS_PORT_OUT_WIDE, ports, port, width, value);
 }
 
+inline long firmwareInterrupts(Handle firmware, unsigned long action, unsigned long a = 0, unsigned long b = 0) {
+    return syscall(SYS_FIRMWARE_INTERRUPTS, firmware, action, a, b);
+}
+
 // POWER_OFF or POWER_RESTART (system programs only). Returns only on failure.
 inline long power(unsigned long action) { return syscall(SYS_POWER, action); }
 
