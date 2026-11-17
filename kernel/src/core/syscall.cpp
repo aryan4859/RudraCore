@@ -3,6 +3,7 @@
 #include "arch/x86_64/io.h"
 #include "arch/x86_64/acpi.h"
 #include "arch/x86_64/apic.h"
+#include "arch/x86_64/efi.h"
 #include "arch/x86_64/iommu.h"
 #include "arch/x86_64/pic.h"
 #include "arch/x86_64/protect.h"
@@ -976,7 +977,9 @@ Arch::Frame* sysFirmwareMemory(Call const& c, Boot::Info const& boot) {
             continue;
         if (r.type == Boot::RegionType::AcpiReclaimable or r.type == Boot::RegionType::AcpiNvs)
             tables = true;
-        else if (r.type != Boot::RegionType::Reserved and r.type != Boot::RegionType::ReservedMapped)
+        else if (r.type != Boot::RegionType::Reserved and r.type != Boot::RegionType::ReservedMapped and
+                 r.type != Boot::RegionType::EfiRuntime and
+                 r.type != Boot::RegionType::EfiRuntimeMmio) // (both were "reserved" before Shool v4: AML may use them)
             return c.result(Abi::ACCESS_DENIED); // RAM, kernel, loader or screen memory
     }
     auto* memory = Core::SharedMemory::device(start, end - start,
@@ -1040,6 +1043,26 @@ Arch::Frame* sysPower(Call const& c) {
         return c.result(Abi::INVALID_ARGUMENT);
     Arch::Acpi::powerOff();
     return c.result(Abi::IO_ERROR); // (still running: it couldn't)
+}
+
+Arch::Frame* sysBootComplete(Call const& c) {
+    if (c.task->privilege == Core::Privilege::App)
+        return c.result(Abi::ACCESS_DENIED);
+    static i64 outcome = 1; // (once per boot: later calls get the same answer)
+    if (outcome == 1) {
+        char const* why = nullptr;
+        if (not Arch::Efi::available()) {
+            log("[boot] the system is up (no boot-attempt counter on this boot: no UEFI runtime services)");
+            outcome = Abi::NOT_FOUND;
+        } else if (Arch::Efi::clearBootCount(why)) {
+            log("[boot] the system is up: boot-attempt counter cleared");
+            outcome = Abi::OK;
+        } else {
+            log("[boot] the system is up, but the boot-attempt counter stays: ", why);
+            outcome = Abi::IO_ERROR;
+        }
+    }
+    return c.result(outcome);
 }
 
 Arch::Frame* sysDmaAddress(Call const& c) {
@@ -1123,6 +1146,7 @@ Arch::Frame* dispatch(Arch::Frame* frame) {
     case Abi::SYS_PORT_OUT_WIDE: return sysPortWide(c, true);
     case Abi::SYS_FIRMWARE_INTERRUPTS: return sysFirmwareInterrupts(c);
     case Abi::SYS_DEVICE_MSI: return sysDeviceMsi(c);
+    case Abi::SYS_BOOT_COMPLETE: return sysBootComplete(c);
 
     default: return c.result(Abi::UNKNOWN_SYSCALL);
     }

@@ -5,6 +5,7 @@
 #include "arch/x86_64/frame.h"
 #include "arch/x86_64/gdt.h"
 #include "arch/x86_64/apic.h"
+#include "arch/x86_64/efi.h"
 #include "arch/x86_64/pic.h"
 #include "arch/x86_64/protect.h"
 #include "core/device.h"
@@ -177,6 +178,8 @@ extern "C" Frame* interruptDispatch(Frame* frame) {
 
     if (Cpu::recoverMsrFault(*frame))
         return frame; // readMsrSafe/writeMsrSafe probed an MSR this CPU lacks
+    if (Efi::recoverFault(*frame))
+        return frame; // the firmware faulted: its call fails, the kernel goes on
 
     if (vector < 32) {
         if (fromUser and vector != Idt::VECTOR_MACHINE_CHECK) { // (#MC is the machine's, not the task's)

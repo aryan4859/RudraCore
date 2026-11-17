@@ -127,6 +127,11 @@ enum Syscall : unsigned long {
                          //   off. Used like any IRQ (wait, bind, ack). Needs RIGHT_MMIO. NOT_FOUND
                          //   without MSI/MSI-X or before the APICs are on (use the pin then);
                          //   ALREADY_EXISTS if the device has one; NO_SPACE when all are taken.
+    SYS_BOOT_COMPLETE = 45, // (): the system is up, so ShoolLoader's boot-attempt counter is cleared
+                            //   (an entry that keeps failing to get here is passed over for its
+                            //   fallback). KamalShell calls it once the desktop has run a while.
+                            //   Root and System programs only (ACCESS_DENIED). NOT_FOUND without
+                            //   UEFI runtime services (BIOS boot); IO_ERROR if the firmware failed.
 };
 
 constexpr unsigned long INTERRUPTS_ROUTE = 1, INTERRUPTS_APIC = 2;

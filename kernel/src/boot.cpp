@@ -18,7 +18,7 @@ namespace {
 volatile Shool::KernelHeader const shoolHeader = {
     .magic = Shool::KERNEL_MAGIC,
     .check = ~Shool::KERNEL_MAGIC,
-    .minVersion = Shool::VERSION,
+    .minVersion = Shool::MIN_VERSION, // (v3: no runtime services, so no boot-attempt counter)
     .maxVersion = Shool::VERSION,
 };
 
@@ -141,6 +141,8 @@ char const* regionTypeName(RegionType type) {
     case RegionType::Kernel: return "kernel";
     case RegionType::Framebuffer: return "framebuffer";
     case RegionType::ReservedMapped: return "reserved-mapped";
+    case RegionType::EfiRuntime: return "efi-runtime";
+    case RegionType::EfiRuntimeMmio: return "efi-runtime-mmio";
     }
     return "?";
 }
@@ -156,16 +158,21 @@ RegionType regionTypeFromShool(u32 type) {
     case Shool::REGION_LOADER_RECLAIMABLE: return RegionType::BootloaderReclaimable;
     case Shool::REGION_KERNEL: return RegionType::Kernel;
     case Shool::REGION_FRAMEBUFFER: return RegionType::Framebuffer;
+    case Shool::REGION_EFI_RUNTIME: return RegionType::EfiRuntime;
+    case Shool::REGION_EFI_RUNTIME_MMIO: return RegionType::EfiRuntimeMmio;
     default: return RegionType::Reserved;
     }
 }
 
 void collectFromShool(Shool::BootInfo const& boot) {
-    info.protocolSupported = boot.version == Shool::VERSION and boot.size == sizeof(Shool::BootInfo);
+    bool v4 = boot.version == 4 and boot.size == sizeof(Shool::BootInfo);
+    info.protocolSupported = v4 or (boot.version == 3 and boot.size == Shool::V3_SIZE);
     if (not info.protocolSupported) {
-        log("[boot] ShoolLoader speaks Shool protocol v", boot.version, ", this kernel v", Shool::VERSION);
+        log("[boot] ShoolLoader speaks Shool protocol v", boot.version, ", this kernel v", Shool::MIN_VERSION, " to v",
+            Shool::VERSION);
         return;
     }
+    info.efiRuntime = v4 ? boot.efiRuntime : 0;
 
     copyString(info.loaderName, sizeof(info.loaderName), boot.loaderName);
     copyString(info.loaderVersion, sizeof(info.loaderVersion), boot.loaderVersion);

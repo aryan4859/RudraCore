@@ -128,6 +128,8 @@ bool isDirectMapped(Boot::RegionType type) {
         return true;
     case Reserved:
     case BadMemory:
+    case EfiRuntime: // (mapped, at its own address, only while the firmware runs: efi.cpp)
+    case EfiRuntimeMmio:
         return false;
     }
     return false;

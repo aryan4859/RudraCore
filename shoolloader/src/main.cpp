@@ -42,6 +42,89 @@ int globalFlag(Efi::Char16 const* name) {
     return value;
 }
 
+// MARK: Boot-attempt counter
+
+static_assert(sizeof(Shool::BootCountVendor) == sizeof(Efi::Guid));
+static_assert(sizeof(Shool::BootCount::attempts) == Config::MAX_ENTRIES);
+constexpr uint32_t COUNT_ATTRIBUTES =
+    Efi::VARIABLE_NON_VOLATILE | Efi::VARIABLE_BOOTSERVICE_ACCESS | Efi::VARIABLE_RUNTIME_ACCESS;
+
+Efi::Guid const* countVendor() { return reinterpret_cast<Efi::Guid const*>(&Shool::BOOT_COUNT_VENDOR); }
+
+Shool::BootCount bootCount; // (global: kept across the fallback jump)
+
+uint32_t configHash(Config const& config) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < config.entryCount; i++) {
+        for (char const* c = config.entries[i].name;; c++) {
+            h = (h ^ static_cast<uint8_t>(*c)) * 16777619u;
+            if (not *c)
+                break;
+        }
+    }
+    return h;
+}
+
+// The counts from earlier boots; fresh ones if there are none, they're
+// damaged, or shool.cfg's entries changed since.
+void readBootCount(Config const& config) {
+    uint32_t hash = configHash(config);
+    Shool::BootCount stored{};
+    uint64_t size = sizeof(stored);
+    bool ok = not Efi::failed(system->runtimeServices->getVariable(Shool::BOOT_COUNT_NAME, countVendor(), nullptr,
+                                                                   &size, &stored)) and
+              size == sizeof(stored) and stored.magic == Shool::BOOT_COUNT_MAGIC and stored.configHash == hash;
+    bootCount = ok ? stored : Shool::BootCount{Shool::BOOT_COUNT_MAGIC, hash, {}};
+}
+
+// An entry that didn't finish booting BOOT_ATTEMPTS_LIMIT times in a row is
+// passed over for its fallback (an entry picked in the menu never is). If
+// the whole chain failed, the counts start over from the chosen entry.
+uint32_t skipFailedEntries(Config const& config, uint32_t index, bool (*usable)(Entry const&)) {
+    uint32_t chosen = index;
+    for (uint32_t steps = 0; steps < Config::MAX_ENTRIES; steps++) {
+        if (bootCount.attempts[index] < Shool::BOOT_ATTEMPTS_LIMIT)
+            return index;
+        print("  ");
+        print(config.entries[index].title);
+        print(" didn't finish starting ");
+        printNumber(bootCount.attempts[index]);
+        print(" times in a row\n");
+        int next = config.entries[index].fallback;
+        for (uint32_t hops = 0; next >= 0 and not usable(config.entries[next]) and hops < Config::MAX_ENTRIES; hops++)
+            next = config.entries[next].fallback;
+        if (next < 0 or not usable(config.entries[next]))
+            break;
+        print("  trying its fallback instead\n");
+        index = static_cast<uint32_t>(next);
+    }
+    print("  its fallbacks failed too: trying it again\n");
+    zeroMemory(bootCount.attempts, sizeof(bootCount.attempts));
+    return chosen;
+}
+
+// Counts this attempt, just before the hand-over. Only for a kernel that
+// can clear it again (Shool v4): an older one would be passed over after
+// booting fine.
+void recordAttempt(uint32_t index, uint32_t protocol, bool diagnostic) {
+    if (protocol < 4) {
+        if (diagnostic)
+            print("  boot attempt not counted: this kernel can't report a finished boot (Shool v3)\n");
+        return;
+    }
+    if (bootCount.attempts[index] < 255)
+        bootCount.attempts[index]++;
+    Efi::Status status = system->runtimeServices->setVariable(Shool::BOOT_COUNT_NAME, countVendor(), COUNT_ATTRIBUTES,
+                                                              sizeof(bootCount), &bootCount);
+    if (Efi::failed(status)) {
+        print("  (this boot attempt can't be counted: the firmware didn't store the variable)\n");
+    } else if (diagnostic) {
+        print("  boot attempt ");
+        printNumber(bootCount.attempts[index]);
+        print(" of this entry counted (cleared once the system is up)\n");
+    }
+}
+
 // D (held while booting, or pressed now) asks for a diagnostic boot.
 bool diagnosticKey() {
     for (int i = 0; i < 64; i++) {
@@ -66,7 +149,7 @@ bool usable(Entry const& e) { return isListed(e.kernel); }
 
 // The menu: the default starts after `timeout` seconds; a key stops the
 // countdown. 1-9 picks an entry, Enter the default, D adds diagnostics.
-uint32_t chooseEntry(Config const& config, bool& diagnostic) {
+uint32_t chooseEntry(Config const& config, bool& diagnostic, bool& picked) {
     uint32_t shown[Config::MAX_ENTRIES];
     uint32_t count = 0;
     for (uint32_t i = 0; i < config.entryCount; i++) {
@@ -106,6 +189,7 @@ uint32_t chooseEntry(Config const& config, bool& diagnostic) {
             print("  diagnostics on\n");
         } else if (key >= u'1' and key < static_cast<Efi::Char16>(u'1' + count)) {
             choice = shown[key - u'1'];
+            picked = true;
             break;
         }
     }
@@ -114,7 +198,8 @@ uint32_t chooseEntry(Config const& config, bool& diagnostic) {
 
 // Loads and starts one entry. Any failure fail()s, which (while the
 // fallback is armed) comes back to efiMain to try the entry's fallback.
-[[noreturn]] void bootEntry(Efi::File* root, Config const& config, Entry const& e, bool secureBoot, bool diagnostic) {
+[[noreturn]] void bootEntry(Efi::File* root, Config const& config, uint32_t index, bool secureBoot, bool diagnostic) {
+    Entry const& e = config.entries[index];
     print("\n  starting: ");
     print(e.title);
     print("\n");
@@ -133,8 +218,9 @@ uint32_t chooseEntry(Config const& config, bool& diagnostic) {
     auto* info = reinterpret_cast<Shool::BootInfo*>(
         allocatePages(alignUp(sizeof(Shool::BootInfo), PAGE_SIZE) / PAGE_SIZE, Efi::SHOOL_RECLAIMABLE));
     info->magic = Shool::MAGIC;
-    info->version = Shool::VERSION;
-    info->size = sizeof(Shool::BootInfo);
+    info->version = kernel.protocol;
+    info->size = kernel.protocol >= 4 ? sizeof(Shool::BootInfo) : Shool::V3_SIZE;
+    info->efiRuntime = reinterpret_cast<uint64_t>(system->runtimeServices); // (UEFI identity-maps: physical)
     copyName(info->loaderName, sizeof(info->loaderName), NAME);
     copyName(info->loaderVersion, sizeof(info->loaderVersion), VERSION);
     info->flags = Shool::FLAG_VERIFIED_BOOT | (secureBoot ? Shool::FLAG_SECURE_BOOT : 0) |
@@ -199,6 +285,7 @@ uint32_t chooseEntry(Config const& config, bool& diagnostic) {
         bootServices->stall(400 * 1000); // let the trident be seen
     }
 
+    recordAttempt(index, kernel.protocol, diagnostic);
     disarmFallback(); // past here, a failure goes back to the firmware
     exitBootServices(*info);
     enterKernel(pml4, Shool::HHDM_OFFSET + stack + STACK_PAGES * PAGE_SIZE, kernel.entry, directMap(info));
@@ -234,7 +321,13 @@ extern "C" Efi::Status efiMain(Efi::Handle image, Efi::SystemTable* systemTable)
     // entry's `fallback` is tried, each entry at most once.
     static uint32_t index;
     static bool tried[Config::MAX_ENTRIES];
-    index = chooseEntry(config, diagnostic);
+    readBootCount(config);
+    bool picked = false;
+    index = chooseEntry(config, diagnostic, picked);
+    // Boot-attempt counter: an entry that keeps failing after the hand-over
+    // (a kernel that crashes or hangs) is passed over too.
+    if (not picked)
+        index = skipFailedEntries(config, index, usable);
     if (saveContext(&fallbackPoint)) {
         int next = config.entries[index].fallback;
         for (uint32_t steps = 0; next >= 0 and (tried[next] or not usable(config.entries[next])) and
@@ -248,6 +341,5 @@ extern "C" Efi::Status efiMain(Efi::Handle image, Efi::SystemTable* systemTable)
     }
     tried[index] = true;
     armFallback();
-    Entry const& e = config.entries[index];
-    bootEntry(root, config, e, secureBoot, diagnostic or e.diagnostic);
+    bootEntry(root, config, index, secureBoot, diagnostic or config.entries[index].diagnostic);
 }

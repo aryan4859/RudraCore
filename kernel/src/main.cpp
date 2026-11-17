@@ -1,4 +1,5 @@
 #include "arch/x86_64/acpi.h"
+#include "arch/x86_64/efi.h"
 #include "arch/x86_64/fpu.h"
 #include "arch/x86_64/frame.h"
 #include "arch/x86_64/gdt.h"
@@ -417,6 +418,7 @@ extern "C" [[noreturn]] void kmain(u64 bootMagic, u64 bootInfo) {
     Arch::Cpu::calibrateTsc(); // (may use the FADT's PM timer)
     Arch::Cpu::initPowerStates();
     Arch::Iommu::init(info); // before any driver can turn on a device's DMA
+    Arch::Efi::init(info);   // runtime services: clearing the boot-attempt counter
 
     if constexpr (RUDRACORE_PANIC_TEST) {
         log("[test] writing to an unmapped address on purpose...");

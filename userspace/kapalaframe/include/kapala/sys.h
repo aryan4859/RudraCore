@@ -195,6 +195,9 @@ inline long firmwareInterrupts(Handle firmware, unsigned long action, unsigned l
     return syscall(SYS_FIRMWARE_INTERRUPTS, firmware, action, a, b);
 }
 
+// The system is up: clears ShoolLoader's boot-attempt counter (system programs only).
+inline long bootComplete() { return syscall(SYS_BOOT_COMPLETE); }
+
 // POWER_OFF or POWER_RESTART (system programs only). Returns only on failure.
 inline long power(unsigned long action) { return syscall(SYS_POWER, action); }
 

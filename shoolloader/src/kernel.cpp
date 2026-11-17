@@ -67,8 +67,9 @@ char const* checkHeader(FileData const& file) {
     return nullptr;
 }
 
-// The kernel must say it takes this loader's protocol version.
-void checkProtocol(FileData const& file) {
+// The kernel must say it takes a protocol version this loader speaks (the
+// newest both know, so an older "previous" kernel still boots). Returns it.
+uint32_t checkProtocol(FileData const& file) {
     Shool::KernelHeader const* header = nullptr;
     for (uint64_t at = 0; at + sizeof(Shool::KernelHeader) <= file.size; at += 8) {
         auto const* h = reinterpret_cast<Shool::KernelHeader const*>(file.data + at);
@@ -79,8 +80,11 @@ void checkProtocol(FileData const& file) {
     }
     if (not header)
         fail("the kernel doesn't say which Shool protocol it speaks (no KernelHeader)");
-    if (Shool::VERSION < header->minVersion or Shool::VERSION > header->maxVersion) {
+    uint32_t version = header->maxVersion < Shool::VERSION ? header->maxVersion : Shool::VERSION;
+    if (version < Shool::MIN_VERSION or version < header->minVersion) {
         print("  this loader speaks Shool protocol v");
+        printNumber(Shool::MIN_VERSION);
+        print(" to v");
         printNumber(Shool::VERSION);
         print("; the kernel takes v");
         printNumber(header->minVersion);
@@ -89,6 +93,7 @@ void checkProtocol(FileData const& file) {
         print("\n");
         fail("the kernel and the loader don't speak the same boot protocol version");
     }
+    return version;
 }
 
 } // namespace
@@ -116,7 +121,7 @@ Kernel loadKernel(FileData const& file) {
         print("\n");
         fail("the kernel isn't a valid 64-bit x86_64 ELF executable");
     }
-    checkProtocol(file);
+    uint32_t protocol = checkProtocol(file);
     auto const* h = reinterpret_cast<ElfHeader const*>(file.data);
     auto const* phs = reinterpret_cast<ElfProgramHeader const*>(file.data + h->programHeaderOffset);
 
@@ -166,7 +171,7 @@ Kernel loadKernel(FileData const& file) {
         copyMemory(reinterpret_cast<void*>(physical + (ph.vaddr - low)), file.data + ph.offset, ph.fileSize);
     }
 
-    return {physical, low, size, h->entry};
+    return {physical, low, size, h->entry, protocol};
 }
 
 } // namespace Loader

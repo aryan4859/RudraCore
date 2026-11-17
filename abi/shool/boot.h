@@ -35,7 +35,12 @@ constexpr uint64_t HHDM_OFFSET = 0xffff800000000000;
 //   1: first version
 //   2: BootInfo.flags (verified boot, Secure Boot, diagnostic mode)
 //   3: BootInfo.mode (normal, safe, recovery)
-constexpr uint32_t VERSION = 3;
+//   4: BootInfo.efiRuntime and the EFI runtime region types (the boot-attempt
+//      counter is cleared through UEFI variables). v3 is still spoken to a
+//      kernel that takes at most v3: then BootInfo ends before efiRuntime
+//      (size V3_SIZE) and the new region types read as reserved.
+constexpr uint32_t VERSION = 4;
+constexpr uint32_t MIN_VERSION = 3; // the oldest the loader still speaks
 
 // What the chosen boot entry asks of the system (BootInfo.mode).
 enum BootMode : uint32_t {
@@ -69,7 +74,30 @@ enum RegionType : uint32_t {
     REGION_LOADER_RECLAIMABLE = 5, // page tables, stack, BootInfo
     REGION_KERNEL = 6,             // the kernel image and modules
     REGION_FRAMEBUFFER = 7,
+    REGION_EFI_RUNTIME = 8,      // v4: UEFI runtime services code and data (RAM)
+    REGION_EFI_RUNTIME_MMIO = 9, // v4: device registers the runtime services use
 };
+
+// The boot-attempt counter (UEFI variable "BhairavBootCount", non-volatile,
+// boot and runtime access, vendor BOOT_COUNT_VENDOR). ShoolLoader adds one
+// to the started entry's count just before handing over; the running system
+// deletes the variable once it's up (SYS_BOOT_COMPLETE). An entry whose count
+// reaches BOOT_ATTEMPTS_LIMIT is skipped for its fallback, unless picked in
+// the menu. `configHash` ties the counts to the entry list they were made for.
+struct BootCount {
+    uint32_t magic;      // BOOT_COUNT_MAGIC
+    uint32_t configHash; // FNV-1a of the entry names, in order
+    uint8_t attempts[8]; // per entry, in shool.cfg order
+};
+constexpr uint32_t BOOT_COUNT_MAGIC = 0x544E4342; // "BCNT"
+constexpr uint8_t BOOT_ATTEMPTS_LIMIT = 2;
+constexpr char16_t BOOT_COUNT_NAME[] = u"BhairavBootCount";
+struct BootCountVendor {
+    uint32_t data1;
+    uint16_t data2, data3;
+    uint8_t data4[8];
+};
+constexpr BootCountVendor BOOT_COUNT_VENDOR = {0x3b8d4c6e, 0x1f2a, 0x4d5b, {0x9c, 0x7e, 0x8a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f}};
 
 struct MemoryRegion {
     uint64_t base;
@@ -123,12 +151,19 @@ struct BootInfo {
 
     uint64_t moduleCount;
     Module modules[MAX_MODULES];
+
+    // v4 from here on.
+    uint64_t efiRuntime; // physical address of the UEFI runtime services table, or 0
 };
 
+constexpr uint32_t V3_SIZE = __builtin_offsetof(BootInfo, efiRuntime);
+
+static_assert(sizeof(BootCount) == 16);
 static_assert(sizeof(MemoryRegion) == 24);
 static_assert(sizeof(Framebuffer) == 40);
 static_assert(sizeof(Module) == 48);
 static_assert(sizeof(KernelHeader) == 24);
-static_assert(sizeof(BootInfo) == 16 + 48 + 8 + 32 + 40 + 8 + 24 * 256 + 8 + 48 * 32);
+static_assert(V3_SIZE == 16 + 48 + 8 + 32 + 40 + 8 + 24 * 256 + 8 + 48 * 32);
+static_assert(sizeof(BootInfo) == V3_SIZE + 8);
 
 } // namespace Shool

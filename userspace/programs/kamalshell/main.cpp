@@ -239,7 +239,16 @@ public:
     }
 
     [[noreturn]] void run() {
+        // The desktop has been up this long: the boot counts as finished, and
+        // ShoolLoader stops counting failed attempts at this boot entry.
+        constexpr unsigned long BOOT_OK_AFTER_MS = 10000;
+        unsigned long started = Sys::timeMs();
+        bool bootReported = false;
         for (;;) {
+            if (not bootReported and Sys::timeMs() - started >= BOOT_OK_AFTER_MS) {
+                Sys::bootComplete();
+                bootReported = true;
+            }
             Sys::Handle handles[2 + MAX_WINDOWS];
             int owners[2 + MAX_WINDOWS];
             unsigned long count = 0;

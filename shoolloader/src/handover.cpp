@@ -108,7 +108,17 @@ uint64_t tablePagesNeeded(MemoryMap const& map, Kernel const& kernel) {
 
 // MARK: Memory map conversion
 
-uint32_t regionType(uint32_t efiType) {
+uint32_t regionType(uint32_t efiType, uint64_t attribute) {
+    constexpr uint64_t EFI_MEMORY_RUNTIME = 1ull << 63;
+    // What the runtime services still use after the hand-over: the kernel maps
+    // these when it calls them (the boot-attempt counter).
+    if (attribute & EFI_MEMORY_RUNTIME) {
+        if (efiType == Efi::MEMORY_MAPPED_IO or efiType == Efi::MEMORY_MAPPED_IO_PORT_SPACE)
+            return Shool::REGION_EFI_RUNTIME_MMIO;
+        if (efiType == Efi::RUNTIME_SERVICES_CODE or efiType == Efi::RUNTIME_SERVICES_DATA or
+            efiType == Efi::RESERVED_MEMORY)
+            return Shool::REGION_EFI_RUNTIME;
+    }
     switch (efiType) {
     case Efi::CONVENTIONAL_MEMORY:
     case Efi::BOOT_SERVICES_CODE:
@@ -130,7 +140,7 @@ void convertMemoryMap(MemoryMap const& map, Shool::BootInfo& info) {
     info.regionCount = 0;
     for (uint64_t i = 0; i < map.count(); i++) {
         auto const& d = map.at(i);
-        Shool::MemoryRegion region{d.physicalStart, d.numberOfPages * PAGE_SIZE, regionType(d.type), 0};
+        Shool::MemoryRegion region{d.physicalStart, d.numberOfPages * PAGE_SIZE, regionType(d.type, d.attribute), 0};
         if (region.length == 0)
             continue;
 

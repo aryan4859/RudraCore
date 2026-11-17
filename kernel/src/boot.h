@@ -25,6 +25,8 @@ enum class RegionType : u8 {
     Kernel,                // the kernel image (and boot modules)
     Framebuffer,
     ReservedMapped,
+    EfiRuntime,     // UEFI runtime services code and data (mapped only while calling them)
+    EfiRuntimeMmio, // device registers they use
 };
 
 char const* regionTypeName(RegionType type);
@@ -76,6 +78,7 @@ struct Info {
     usize moduleCount;
 
     u64 acpiRsdp; // physical address of the ACPI RSDP, or 0
+    u64 efiRuntime; // physical address of the UEFI runtime services table, or 0 (BIOS, Shool v3)
 };
 
 // Reads the boot information from whichever bootloader started the kernel.

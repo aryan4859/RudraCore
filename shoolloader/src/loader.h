@@ -141,6 +141,7 @@ struct Kernel {
     uint64_t virtualBase; // its lowest virtual address
     uint64_t size;        // page aligned
     uint64_t entry;
+    uint32_t protocol;    // the Shool version to hand over with
 };
 
 // Checks the ELF file thoroughly (headers, segments in the top 2 GiB and not
