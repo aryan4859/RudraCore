@@ -3,6 +3,7 @@
 #include "mem/vmm.h"
 
 #include "arch/x86_64/cpu.h"
+#include "arch/x86_64/smp.h"
 #include "log.h"
 #include "mem/memory.h"
 #include "mem/pmm.h"
@@ -219,6 +220,7 @@ void Space::unmap(u64 virt, u64 size) {
         }
         offset += SIZE_4K;
     }
+    Arch::Smp::flushOthers(*this, virt, size / SIZE_4K); // other CPUs that may have cached them
 }
 
 namespace {
@@ -243,6 +245,7 @@ bool Space::take(u64 virt, u64& phys, bool& owned) {
     owned = *e & OWNED_PAGE;
     *e = 0;
     Arch::invalidatePage(virt);
+    Arch::Smp::flushOthers(*this, virt, 1); // (before the page can be freed and reused)
     return true;
 }
 
@@ -254,6 +257,7 @@ bool Space::update(u64 virt, u32 access) {
     u64 flags = leafFlags(access & ~OWNED, Cache::WriteBack, false) & ~(PWT | PCD | PAT_4K);
     *e = keep | flags;
     Arch::invalidatePage(virt);
+    Arch::Smp::flushOthers(*this, virt, 1);
     return true;
 }
 

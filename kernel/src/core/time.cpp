@@ -1,5 +1,6 @@
 #include "core/time.h"
 
+#include "arch/x86_64/cpu.h"
 #include "arch/x86_64/pic.h"
 #include "arch/x86_64/pit.h"
 #include "arch/x86_64/rtc.h"
@@ -13,7 +14,24 @@ u64 bootUnixTime = 0;
 
 } // namespace
 
+u64 startTsc = 0;
+
+u64 cyclesToNs(u64 cycles) {
+    u64 khz = Arch::Cpu::features().tscHz / 1000;
+    if (not khz)
+        return 0;
+    // (no 128-bit division in the kernel: whole milliseconds, then the rest)
+    return cycles / khz * 1000000 + cycles % khz * 1000000 / khz;
+}
+
+u64 nanoseconds() {
+    if (not Arch::Cpu::features().tscHz)
+        return now() * 1000000;
+    return cyclesToNs(Arch::readTsc() - startTsc);
+}
+
 void init() {
+    startTsc = Arch::readTsc();
     bootUnixTime = Arch::Rtc::unixTime();
     Arch::Pit::init(TICKS_PER_SECOND);
     Arch::Pic::unmask(0);

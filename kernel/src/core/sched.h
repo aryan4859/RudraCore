@@ -38,6 +38,9 @@ struct Task {
 
     Process* process = nullptr; // nullptr for kernel tasks (holds a reference)
     u64 fsBase = 0;             // thread-local storage: the FS segment base (IA32_FS_BASE)
+    u32 cpu = 0;                // the CPU whose queue it's on (or that ran it last)
+    u32 lockDepth = 0;          // the kernel lock it held when it was switched out
+    u64 lastBoost = 0;          // when a wake-up last put it at the head of its queue (fairness)
     u64 cpuMs = 0; // CPU time used so far (in 1 ms timer ticks)
     u64 wakeAt = 0;
     u64 waitDeadline = 0; // while in a timed wait: when it gives up (0 = none)
@@ -69,15 +72,24 @@ struct Task {
 
 #include "core/process.h"
 
-// Preemptive round-robin scheduler with a 10 ms time slice.
+// Preemptive round-robin scheduler with a 10 ms time slice, one per CPU.
 //
 // Task switches happen only on the way out of an interrupt: the interrupt
 // handler returns the frame of the task to resume, and the entry code in
 // interrupts.S switches to that task's stack before restoring registers.
+//
+// Each CPU has its own ready queues and runs its own idle task. A task that
+// becomes ready goes back to the CPU it ran on, unless that one is busier
+// than the least busy CPU by more than one task (then it moves); an idle CPU
+// is told at once (an IPI), and a CPU with nothing to run takes work from
+// the busiest. All of it runs under the kernel lock.
 namespace Rudracore::Sched {
 
-// Turns the boot context (kmain) into the idle task.
+// Turns the boot context (kmain) into the boot CPU's idle task.
 void init();
+
+// The same for another CPU starting up (its stack's top: its idle task's).
+void initCpu(u32 cpu, u64 stackTop);
 
 Core::Task* spawnKernel(char const* name, void (*entry)(u64), u64 arg);
 
@@ -133,7 +145,12 @@ void wake(Core::Task* task);
 
 // For interrupt handlers (interrupts disabled). Each returns the frame of
 // the task to resume, which may be a different task.
+// The PIT (1 ms, on the boot CPU): the clock, sleepers, and this CPU's slice.
 Arch::Frame* onTimerTick(Arch::Frame* frame);
+// Another CPU's own local APIC timer (1 ms): its slice.
+Arch::Frame* onCpuTick(Arch::Frame* frame);
+// A reschedule IPI: work arrived here, or the running thread was ended.
+Arch::Frame* onReschedule(Arch::Frame* frame);
 Arch::Frame* switchFrom(Arch::Frame* frame);
 Arch::Frame* sleepCurrent(Arch::Frame* frame, u64 milliseconds);
 

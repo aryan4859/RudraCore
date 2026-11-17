@@ -24,6 +24,7 @@ enum class Cache : u8 {
 
 struct Space {
     u64 root = 0; // physical address of the top-level page table
+    mutable u64 cpuMask = 0; // CPUs that have it loaded now (their TLBs may hold it: shootdowns)
 
     // Maps [virt, virt + size) to [phys, phys + size). Everything must be
     // page aligned. Uses 2 MiB pages where alignment allows. Returns false if

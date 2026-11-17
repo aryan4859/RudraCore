@@ -93,6 +93,10 @@ inline long processLimit(Handle process, unsigned long limit, unsigned long valu
 inline long processEvents(Handle endpoint) { return syscall(SYS_PROCESS_EVENTS, endpoint); }
 inline long processInfo(Handle process, ProcessInfo& out) { return syscall(SYS_PROCESS_INFO, process, arg(&out)); }
 
+// Nanoseconds since boot, for measuring.
+inline unsigned long timeNs() { return static_cast<unsigned long>(syscall(SYS_TIME_NS)); }
+inline long kernelCounters(KernelCounters& out) { return syscall(SYS_KERNEL_COUNTERS, arg(&out)); }
+
 // Every process (up to `capacity` written): returns how many there are.
 inline long taskList(TaskInfo* out, unsigned long capacity) { return syscall(SYS_TASK_LIST, arg(out), capacity); }
 

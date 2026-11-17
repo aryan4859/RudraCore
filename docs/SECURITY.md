@@ -515,3 +515,35 @@ Kernel maturity, step 4.1. A program's address space is now regions (`core/vm.{h
 - File pages are dropped in object order, not least recently used. The fs server serves at most 15 mapped files at once (one wait call), and mapped files are read-only (no shared writable file mappings, no write-back).
 - A paged object's page tables aren't promised (they come out of the reserve's margin).
 - A system call whose buffer waits on a pager runs again from the start; calls validate their buffers before acting, so nothing is done twice, but a call that acted first and validated later would.
+
+## 22. Processes and threads (step 4.2)
+
+A process (`core/process.{h,cpp}`) holds the address space, handles, quota, regions, group, limits, exit status and event channel. Threads (`Task`) hold their stack, registers, state and TLS base. A process's id is its first thread's id.
+
+- **Threads:** `thread_create`, `thread_exit` and `thread_join` (exit codes, timeouts). The last thread to end ends the process. `exit` ends every thread.
+- **Thread-local storage:** each thread has its own FS base. The PT_TLS segment is in `userspace/link.ld`, and the runtime builds each thread's block, so `thread_local` works.
+- **Synchronization:** futexes are keyed by physical address, so threads of different processes sharing memory meet too. `Kapala::Mutex` and `Condition` are built on them, and the userspace heap is now locked.
+- **Process handles:** spawn with `SPAWN_HANDLE`. `process_wait` returns the exit code. `process_info` gives the fault vector, address and RIP after a crash.
+- **Exit codes:** the program's own, or EXIT_FAULT, EXIT_KILLED, EXIT_CPU_LIMIT or EXIT_OUT_OF_MEMORY when the kernel ended it.
+- **Groups:** a child joins its parent's group, unless spawned with `SPAWN_NEW_GROUP`. `SIGNAL_GROUP` reaches the whole group, and an app may signal only apps.
+- **Limits:** `process_limit` lowers memory, objects, threads or CPU time, and never raises them.
+- **Signals equivalent:** events are messages on a channel the process registers (`process_events`). SIGNAL_TERMINATE arrives as an event, and ends the process if it doesn't listen. SIGNAL_KILL always ends it. Faults end the process; there are no asynchronous handlers.
+- **Tested:** thread-test, 25 checks. It covers TLS, a contended mutex, a condition variable, join, futex rules, wait, terminate as an event, kill, the CPU limit, fault post-mortem, group signal and the thread limit.
+
+## 23. SMP (step 4.3)
+
+- **AP startup:** `ap_start.S` is a real-mode → long-mode trampoline in a page below 1 MiB, with its page tables below 4 GiB. CPUs start with INIT, then STARTUP twice. Each copies the boot CPU's CR0, CR4 and PAT.
+- **Per-CPU data:** a TSS per CPU in one GDT. `str` tells a CPU which one it is.
+- **Per-CPU scheduler:** each CPU has its own ready queues and idle task. A ready task goes back to the CPU it last ran on, unless another CPU is less busy by more than one task. An idle CPU gets a reschedule IPI, and a CPU with nothing to run takes work from the busiest.
+- **Timers:** each CPU has a local APIC timer at 1 ms, measured against the TSC. The PIT keeps the time on the boot CPU.
+- **Kernel lock:** a recursive ticket lock. `InterruptGuard` takes it, so every existing critical section is serialized across CPUs, while user code runs in parallel.
+  - Its depth travels with the task, since kernel tasks can switch inside a guard.
+  - It's released in `interrupts.S` after the stack switch, so no CPU can resume or free a thread whose stack another CPU is still on.
+- **Interrupt distribution:** the I/O APIC lines and MSIs go to the CPUs in turn. The timer line stays on the boot CPU.
+- **IPIs:** reschedule, TLB and stop.
+- **TLB shootdowns:** every `unmap`, `take` and `update` flushes the other CPUs that have the address space loaded (each space tracks them in `cpuMask`), or every CPU for kernel addresses. A CPU waiting for the kernel lock still services shootdowns and a panic's stop, so neither can deadlock.
+- **Ending threads on other CPUs:** a thread running elsewhere is marked dead and its CPU gets an IPI. Its stack is freed only once no CPU is on it.
+- **Panic:** stops every other CPU.
+- **Tested (`SMP=4`):** 4 CPUs come up, and every boot check passes, including thread-test and harden-test. 1000 IPC round trips take 106 ms, against 2.3 s on 1 CPU. 1 CPU still passes everything.
+
+**Limits.** It's one big kernel lock, not fine-grained locking: kernel work doesn't scale across CPUs. Up to 16 CPUs, xAPIC only. MTRRs are left as the firmware set them, and machine-check banks are set up only on the boot CPU. Not tried on real hardware.

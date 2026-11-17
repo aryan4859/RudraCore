@@ -2,6 +2,7 @@
 
 #include "arch/x86_64/cpu.h"
 #include "arch/x86_64/io.h"
+#include "arch/x86_64/smp.h"
 #include "display.h"
 #include "log.h"
 
@@ -13,6 +14,7 @@ namespace Rudracore {
 namespace {
 
 bool panicking = false;
+u32 panicCpu = 0;
 
 // Frames live on kernel stacks, which are inside the kernel image (.bss).
 bool isValidFrame(u64 rbp) {
@@ -27,12 +29,15 @@ namespace Panic {
 
 void begin(char const* title) {
     Arch::disableInterrupts();
-    if (panicking) {
+    if (__atomic_exchange_n(&panicking, true, __ATOMIC_ACQ_REL)) {
+        if (Arch::Smp::index() != panicCpu)
+            Arch::halt(); // another CPU is panicking already: it reports
         log("");
         log("!!! panic while panicking: ", title);
         Arch::halt();
     }
-    panicking = true;
+    panicCpu = Arch::Smp::index();
+    Arch::Smp::stopOthers(); // every other CPU halts; this one gets the kernel lock, whatever it was doing
 
     Display::showPanicScreen(title);
     log("");

@@ -10,6 +10,7 @@
 #                 QEMU monitor commands to run after KEYS (tests the mouse)
 #   NIC=e1000     the network card: e1000 or rtl8139
 #   CPU=max       QEMU CPU model (max has SMEP and SMAP; the default has neither)
+#   SMP=4         number of CPUs (default 1)
 #   IOMMU=1       add an Intel VT-d IOMMU (DMA and interrupt remapping);
 #                 IOMMU=dma-only leaves interrupt remapping out
 #   STEP=0.3      seconds between MONITOR commands (lower it for double clicks)
@@ -52,6 +53,9 @@ if [ -n "${ACPI_TABLE:-}" ]; then
 fi
 if [ -n "${CPU:-}" ]; then
     set -- "$@" -cpu "$CPU"
+fi
+if [ -n "${SMP:-}" ]; then
+    set -- "$@" -smp "$SMP"
 fi
 if [ -n "$FIRMWARE" ]; then
     set -- "$@" -bios "$FIRMWARE"

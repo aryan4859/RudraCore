@@ -190,6 +190,21 @@ enum Syscall : unsigned long {
     SYS_PROCESS_EVENTS = 59, // (Handle endpoint): where this process's events go (an Event message per
                              //   event, to the endpoint's peer); NO_HANDLE stops them. The endpoint moves.
     SYS_PROCESS_INFO = 60,   // (Handle process, ProcessInfo* out)
+
+    // Performance.
+    SYS_TIME_NS = 61,         // () -> nanoseconds since boot (the TSC: for measuring)
+    SYS_KERNEL_COUNTERS = 62, // (KernelCounters* out): the kernel's event counters (instrumentation)
+};
+
+// SYS_KERNEL_COUNTERS: running totals since boot.
+struct KernelCounters {
+    unsigned long syscalls, interrupts, pageFaults;
+    unsigned long switches, switchNs;          // context switches, and the time spent in them
+    unsigned long lockAcquires, lockContended; // the kernel lock: taken, and taken after waiting
+    unsigned long lockWaitNs;                  // time CPUs spent waiting for it
+    unsigned long ipis, shootdowns;
+    unsigned long heapAllocs, heapNs;          // kernel heap allocations, and their time
+    unsigned long cpus;
 };
 
 // SYS_SPAWN (5th argument) and SYS_SPAWN_IMAGE (2nd) flags.

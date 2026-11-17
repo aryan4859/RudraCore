@@ -9,6 +9,7 @@
 #include "arch/x86_64/pci.h"
 #include "arch/x86_64/pic.h"
 #include "arch/x86_64/protect.h"
+#include "arch/x86_64/smp.h"
 #include "boot.h"
 #include "config.h"
 
@@ -173,10 +174,12 @@ void testHeap() {
 // timer working: it runs every 250 ms no matter what else is going on.
 void clockTask(u64) {
     for (;;) {
-        Display::drawStatus(Time::now(), Sched::taskCount(),
-                            Pmm::stats().freePages * Mem::PAGE_SIZE,
-                            Heap::stats().bytesInUse);
-        Arch::Iommu::reportFaults();
+        {
+            Arch::InterruptGuard guard; // (the console is shared with every CPU's log lines)
+            Display::drawStatus(Time::now(), Sched::taskCount(), Pmm::stats().freePages * Mem::PAGE_SIZE,
+                                Heap::stats().bytesInUse);
+            Arch::Iommu::reportFaults();
+        }
         Sched::sleep(250);
     }
 }
@@ -408,6 +411,7 @@ extern "C" [[noreturn]] void kmain(u64 bootMagic, u64 bootInfo) {
     Arch::Cpu::enableMachineChecks();
 
     Pmm::init(info);
+    Arch::Smp::reserveTrampoline(); // (a page below 1 MiB, while it's still free)
     Vmm::init(info);
     log("[vmm]  running on RudraCore's own page tables");
     Arch::Protect::enableSmepSmap();
@@ -450,7 +454,8 @@ extern "C" [[noreturn]] void kmain(u64 bootMagic, u64 bootInfo) {
     if (info.diagnostic)
         Heap::report();
 
-    log("[sched] starting: 1 ms timer, 10 ms time slices");
+    Arch::Smp::startOthers(); // the other CPUs join in from here
+    log("[sched] starting: 1 ms timer, 10 ms time slices, ", Arch::Smp::count(), " CPU(s)");
     log("");
     Sched::idle();
 }

@@ -15,6 +15,13 @@ void tick();
 // Milliseconds since the timer started.
 u64 now();
 
+// Nanoseconds since the timer started: the TSC (calibrated at boot; the
+// same on every CPU), else milliseconds scaled. For measuring, not waking.
+u64 nanoseconds();
+
+// TSC cycles as nanoseconds (0 if the TSC rate is unknown).
+u64 cyclesToNs(u64 cycles);
+
 // Seconds since 1970-01-01 (UTC), from the hardware clock read at boot.
 u64 unixTime();
 

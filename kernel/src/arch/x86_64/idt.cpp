@@ -8,7 +8,9 @@
 #include "arch/x86_64/efi.h"
 #include "arch/x86_64/pic.h"
 #include "arch/x86_64/protect.h"
+#include "arch/x86_64/smp.h"
 #include "core/device.h"
+#include "core/counters.h"
 #include "core/sched.h"
 #include "core/syscall.h"
 #include "core/vm.h"
@@ -160,6 +162,10 @@ void init() {
         };
     }
 
+    load();
+}
+
+void load() {
     Pointer pointer{sizeof(entries) - 1, reinterpret_cast<u64>(entries)};
     asm volatile("lidt %0" : : "m"(pointer));
 }
@@ -169,13 +175,43 @@ void init() {
 using namespace Rudracore;
 using namespace Rudracore::Arch;
 
+// After interruptDispatch, on the resumed task's stack (interrupts.S).
+extern "C" void interruptLeave() { Smp::leaveKernel(); }
+
+namespace {
+constexpr u64 VECTOR_PAGE_FAULT_ID = 14;
+}
+
 // Called by interruptCommon (interrupts.S) for every interrupt, with
 // interrupts disabled. Returns the frame to resume: the same one, or another
-// task's when the scheduler switches.
+// task's when the scheduler switches. Runs holding the kernel lock (taken
+// here, let go by interruptLeave), except for what the lock holder may be
+// waiting for: a TLB shootdown, a panic's stop.
 extern "C" Frame* interruptDispatch(Frame* frame) {
-    Protect::closeUserAccess();
     u64 vector = frame->vector;
+    if (vector == Smp::VECTOR_TLB) {
+        Smp::serviceShootdown();
+        Apic::localEndOfInterrupt();
+        return frame;
+    }
+    if (vector == Smp::VECTOR_STOP)
+        for (;;)
+            asm volatile("cli; hlt");
+    Smp::enterKernel();
+    Protect::closeUserAccess();
     bool fromUser = frame->cs & 3;
+    Counters::add(vector == Abi::SYSCALL_VECTOR ? Counters::all.syscalls
+                  : vector == VECTOR_PAGE_FAULT_ID ? Counters::all.pageFaults
+                                                   : Counters::all.interrupts);
+
+    if (vector == Smp::VECTOR_TIMER) { // this CPU's own tick
+        Apic::localEndOfInterrupt();
+        return Sched::onCpuTick(frame);
+    }
+    if (vector == Smp::VECTOR_RESCHEDULE) { // work was queued here
+        Apic::localEndOfInterrupt();
+        return Sched::onReschedule(frame);
+    }
 
     if (vector == Idt::VECTOR_BREAKPOINT and not fromUser) {
         // Not fatal: log and resume after the int3 instruction.

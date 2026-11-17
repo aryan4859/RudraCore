@@ -37,17 +37,34 @@ inline void waitForInterrupt() {
     asm volatile("hlt" ::: "memory");
 }
 
-// Disables interrupts for the lifetime of the guard, then restores the
-// previous state. On a single CPU this is the kernel's lock: nothing can
-// preempt code holding a guard. Guards can be nested.
+// Multiprocessing (smp.cpp). The kernel lock: one CPU at a time runs kernel
+// code (interrupt handlers, system calls, guarded sections), while user code
+// runs on every CPU at once. It's recursive, and its depth travels with the
+// task that holds it across a task switch.
+namespace Smp {
+// Which CPU runs this (0: the boot CPU), from the TSS it loaded.
+inline u32 index() {
+    u16 selector;
+    asm volatile("str %0" : "=r"(selector));
+    return selector >= 0x28 ? (selector - 0x28u) / 16u : 0u; // (Gdt::TSS + 16 * cpu)
+}
+void enterKernel(); // waits for the kernel lock (taking IPIs that can't wait meanwhile)
+void leaveKernel();
+} // namespace Smp
+
+// Disables interrupts and takes the kernel lock for the lifetime of the
+// guard, then restores both. Nothing else runs kernel code meanwhile, on
+// this CPU or any other. Guards can be nested.
 struct InterruptGuard {
     u64 flags;
 
     InterruptGuard() {
         asm volatile("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+        Smp::enterKernel();
     }
 
     ~InterruptGuard() {
+        Smp::leaveKernel();
         if (flags & (1 << 9)) // IF was set
             asm volatile("sti" ::: "memory");
     }

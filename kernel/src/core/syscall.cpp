@@ -8,6 +8,8 @@
 #include "arch/x86_64/pic.h"
 #include "arch/x86_64/protect.h"
 #include "core/channel.h"
+#include "arch/x86_64/smp.h"
+#include "core/counters.h"
 #include "core/device.h"
 #include "core/futex.h"
 #include "core/process.h"
@@ -1556,6 +1558,30 @@ Arch::Frame* sysProcessInfo(Call const& c) {
     return c.result(Abi::OK);
 }
 
+Arch::Frame* sysKernelCounters(Call const& c) {
+    if (not c.userMemory(c.arg0(), sizeof(Abi::KernelCounters), true))
+        return c.result(Abi::BAD_ADDRESS);
+    auto ns = Time::cyclesToNs;
+    auto const& a = Counters::all;
+    Abi::KernelCounters k;
+    memset(&k, 0, sizeof(k));
+    k.syscalls = a.syscalls;
+    k.interrupts = a.interrupts;
+    k.pageFaults = a.pageFaults;
+    k.switches = a.switches;
+    k.switchNs = ns(a.switchCycles);
+    k.lockAcquires = a.lockAcquires;
+    k.lockContended = a.lockContended;
+    k.lockWaitNs = ns(a.lockSpinCycles);
+    k.ipis = a.ipis;
+    k.shootdowns = a.shootdowns;
+    k.heapAllocs = a.heapAllocs;
+    k.heapNs = ns(a.heapCycles);
+    k.cpus = Arch::Smp::count();
+    toUser(c.arg0(), &k, sizeof(k));
+    return c.result(Abi::OK);
+}
+
 Boot::Info const* bootInfo = nullptr;
 
 } // namespace
@@ -1681,6 +1707,8 @@ Arch::Frame* run(Call const& c) {
     case Abi::SYS_PROCESS_LIMIT: return sysProcessLimit(c);
     case Abi::SYS_PROCESS_EVENTS: return sysProcessEvents(c);
     case Abi::SYS_PROCESS_INFO: return sysProcessInfo(c);
+    case Abi::SYS_TIME_NS: return c.result(static_cast<i64>(Time::nanoseconds()));
+    case Abi::SYS_KERNEL_COUNTERS: return sysKernelCounters(c);
 
     default: return c.result(Abi::UNKNOWN_SYSCALL);
     }

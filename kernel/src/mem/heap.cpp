@@ -1,5 +1,6 @@
 #include "mem/heap.h"
 
+#include "core/counters.h"
 #include "arch/x86_64/cpu.h"
 #include "log.h"
 #include "mem/memory.h"
@@ -92,8 +93,19 @@ void used(u64 size) {
 
 } // namespace
 
+void* allocate(usize size);
+
+// (Timed: memory allocation performance, in kernel_counters.)
 void* alloc(usize size) {
     Arch::InterruptGuard guard;
+    u64 started = Arch::readTsc();
+    void* p = allocate(size);
+    Counters::add(Counters::all.heapAllocs);
+    Counters::add(Counters::all.heapCycles, Arch::readTsc() - started);
+    return p;
+}
+
+void* allocate(usize size) {
     usize needed = size + sizeof(Header);
 
     for (usize c = 0; c < CLASS_COUNT; c++) {

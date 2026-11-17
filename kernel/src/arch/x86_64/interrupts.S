@@ -43,6 +43,10 @@ interruptCommon:
     movq %rsp, %rdi
     call interruptDispatch
     movq %rax, %rsp /* resume the frame returned: maybe another task's */
+    /* Only now, on the stack of the task being resumed, the kernel lock is
+       let go: until here this CPU was still on the old task's stack, which
+       another CPU could otherwise start running (or free) meanwhile. */
+    call interruptLeave
 
     popq %r15
     popq %r14

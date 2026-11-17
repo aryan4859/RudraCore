@@ -11,6 +11,9 @@ constexpr u8 YIELD_VECTOR = 0x81;
 
 void init();
 
+// Loads the (one, shared) IDT on the CPU running this.
+void load();
+
 char const* exceptionName(u64 vector);
 
 } // namespace Rudracore::Arch::Idt
