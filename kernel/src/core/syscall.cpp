@@ -1033,6 +1033,22 @@ Arch::Frame* sysFirmwareInterrupts(Call const& c) {
     return c.result(Abi::INVALID_ARGUMENT);
 }
 
+// The acpi server's passive cooling: a cap on the CPU's performance.
+Arch::Frame* sysFirmwarePerformance(Call const& c) {
+    i64 error = 0;
+    if (not c.lookup<Core::Firmware>(c.arg0(), ObjectType::Firmware, Abi::RIGHT_WRITE, error))
+        return c.result(error);
+    if (c.arg1() < 1 or c.arg1() > 100)
+        return c.result(Abi::INVALID_ARGUMENT);
+    if (not Arch::Cpu::setPerformanceLimit(static_cast<u32>(c.arg1())))
+        return c.result(Abi::NOT_FOUND);
+    if (c.arg1() == 100)
+        log("[cpu]  thermal: performance cap lifted");
+    else
+        log("[cpu]  thermal: performance capped at ", c.arg1(), "%");
+    return c.result(Abi::OK);
+}
+
 // Turns the machine off or restarts it (ACPI). Not for apps.
 Arch::Frame* sysPower(Call const& c) {
     if (c.task->privilege == Core::Privilege::App)
@@ -1147,6 +1163,7 @@ Arch::Frame* dispatch(Arch::Frame* frame) {
     case Abi::SYS_FIRMWARE_INTERRUPTS: return sysFirmwareInterrupts(c);
     case Abi::SYS_DEVICE_MSI: return sysDeviceMsi(c);
     case Abi::SYS_BOOT_COMPLETE: return sysBootComplete(c);
+    case Abi::SYS_FIRMWARE_PERFORMANCE: return sysFirmwarePerformance(c);
 
     default: return c.result(Abi::UNKNOWN_SYSCALL);
     }

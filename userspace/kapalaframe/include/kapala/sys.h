@@ -191,6 +191,11 @@ inline long portOutWide(Handle ports, unsigned port, unsigned width, unsigned lo
     return syscall(SYS_PORT_OUT_WIDE, ports, port, width, value);
 }
 
+// Thermal throttling: caps the CPU at `percent` (1-100) of its performance; 100 lifts it.
+inline long firmwarePerformance(Handle firmware, unsigned long percent) {
+    return syscall(SYS_FIRMWARE_PERFORMANCE, firmware, percent);
+}
+
 inline long firmwareInterrupts(Handle firmware, unsigned long action, unsigned long a = 0, unsigned long b = 0) {
     return syscall(SYS_FIRMWARE_INTERRUPTS, firmware, action, a, b);
 }

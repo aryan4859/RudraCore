@@ -78,6 +78,7 @@ constexpr u32 APIC_BASE = 0x1B;
 constexpr u32 PLATFORM_INFO = 0xCE;       // Intel: base (non-turbo) ratio in bits 8-15
 constexpr u32 MCG_CAP = 0x179, MCG_STATUS = 0x17A;
 constexpr u32 PERF_STATUS = 0x198;
+constexpr u32 CLOCK_MODULATION = 0x19A;
 constexpr u32 MC0_CTL = 0x400;            // bank i: CTL, STATUS, ADDR, MISC at 0x400 + 4i
 constexpr u32 PM_ENABLE = 0x770, HWP_CAPABILITIES = 0x771, HWP_REQUEST = 0x774;
 constexpr u32 EFER = 0xC0000080;
@@ -109,6 +110,7 @@ struct Features {
     // Optional.
     bool apic, x2apic, pge, mce, mca, sse3, ssse3, sse41, sse42, avx, xsave, rdrand, rdseed;
     bool smep, smap, monitor, mwaitBreak, invariantTsc, tscDeadline, hwp, hwpEpp, pdpe1gb;
+    bool clockModulation, extendedClockModulation; // software-controlled clock (thermal throttling)
     u32 mwaitSubStates;   // CPUID 5 EDX: sub-states per MWAIT C-state, 4 bits each
     u64 tscHz;            // 0 until calibrateTsc() (or if it couldn't)
     char const* tscSource;
@@ -138,6 +140,11 @@ void reportMachineCheck();
 // P-states (Intel HWP: the CPU picks its own frequency) and the C-state the
 // idle loop sleeps in. Logs both.
 void initPowerStates();
+// Thermal throttling (the acpi server's passive cooling): caps the CPU at
+// `percent` (1-100) of its performance, through HWP's maximum, else clock
+// modulation. 100 lifts the cap. False if the CPU has neither.
+bool setPerformanceLimit(u32 percent);
+
 // Sleeps until the next interrupt, in the deepest chosen C-state, then
 // returns with interrupts enabled.
 void idle();

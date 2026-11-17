@@ -507,13 +507,20 @@ run-secureboot: $(ISO) $(DISK) $(BUILD)/ovmf-vars-secureboot.fd
 
 # Boots headless, saves the screen to build/screen.png and the serial log to
 # build/serial.log. Set FIRMWARE=uefi to boot through UEFI instead of BIOS.
-shot: $(ISO) $(DISK) $(if $(ACPI_TEST),$(BUILD)/acpi-test.aml)
-	NIC=$(NIC) $(if $(ACPI_TEST),ACPI_TABLE=$(BUILD)/acpi-test.aml) sh scripts/screenshot.sh $(ISO) $(BUILD) $(DISK) \
+shot: $(ISO) $(DISK) $(if $(ACPI_TEST),$(BUILD)/acpi-test.aml) $(if $(THERMAL_TEST),$(BUILD)/thermal-test.aml)
+	NIC=$(NIC) $(if $(ACPI_TEST),ACPI_TABLE=$(BUILD)/acpi-test.aml) \
+		$(if $(THERMAL_TEST),ACPI_TABLE=$(BUILD)/thermal-test.aml) sh scripts/screenshot.sh $(ISO) $(BUILD) $(DISK) \
 		$(if $(filter uefi,$(FIRMWARE)),$(OVMF))
 
 # A test SSDT with a battery, an AC adapter and a thermal zone (QEMU has
 # none): `make shot ACPI_TEST=1`.
 $(BUILD)/acpi-test.aml: scripts/acpi-test.asl
+	@mkdir -p $(@D)
+	iasl -p $(basename $@) $< >/dev/null
+
+# The thermal policy's test zone (warms, cools, then reaches critical):
+# `make shot THERMAL_TEST=1`.
+$(BUILD)/thermal-test.aml: scripts/thermal-test.asl
 	@mkdir -p $(@D)
 	iasl -p $(basename $@) $< >/dev/null
 

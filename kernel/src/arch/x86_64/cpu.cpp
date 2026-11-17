@@ -20,6 +20,8 @@ constexpr u64 MCG_CTL_PRESENT = 1ull << 8;
 
 Features f{};
 i32 mwaitHint = -1; // -1: hlt
+u64 hwpLowest = 0, hwpHighest = 0; // HWP's range, once it's on
+bool hwpOn = false;
 alignas(64) u64 volatile monitorLine = 0;
 
 bool bit(u32 value, u32 n) { return (value >> n) & 1; }
@@ -73,7 +75,7 @@ void detect() {
         f.model += ((a >> 16) & 0xF) << 4;
     f.fpu = bit(d, 0), f.tsc = bit(d, 4), f.msr = bit(d, 5), f.pae = bit(d, 6), f.mce = bit(d, 7);
     f.cx8 = bit(d, 8), f.apic = bit(d, 9), f.pge = bit(d, 13), f.mca = bit(d, 14), f.cmov = bit(d, 15);
-    f.fxsr = bit(d, 24), f.sse = bit(d, 25), f.sse2 = bit(d, 26);
+    f.fxsr = bit(d, 24), f.sse = bit(d, 25), f.sse2 = bit(d, 26), f.clockModulation = bit(d, 22);
     f.sse3 = bit(c, 0), f.monitor = bit(c, 3), f.ssse3 = bit(c, 9), f.sse41 = bit(c, 19), f.sse42 = bit(c, 20);
     f.x2apic = bit(c, 21), f.tscDeadline = bit(c, 24), f.xsave = bit(c, 26), f.avx = bit(c, 28);
     f.rdrand = bit(c, 30), f.hypervisor = bit(c, 31);
@@ -85,7 +87,7 @@ void detect() {
     }
     if (maxLeaf >= 6) {
         cpuid(6, 0, a, b, c, d);
-        f.hwp = bit(a, 7), f.hwpEpp = bit(a, 10);
+        f.hwp = bit(a, 7), f.hwpEpp = bit(a, 10), f.extendedClockModulation = bit(a, 5);
     }
     if (maxLeaf >= 7) {
         cpuid(7, 0, a, b, c, d);
@@ -363,6 +365,7 @@ void initPowerStates() {
         u64 highest = cap & 0xFF, guaranteed = (cap >> 8) & 0xFF, lowest = (cap >> 24) & 0xFF;
         constexpr u64 BALANCED = 0x80;
         writeMsr(Msr::HWP_REQUEST, lowest | highest << 8 | (f.hwpEpp ? BALANCED << 24 : 0));
+        hwpLowest = lowest, hwpHighest = highest, hwpOn = true;
         log("[cpu]  p-states: Intel HWP on, ", lowest * 100, "-", highest * 100, " MHz (", guaranteed * 100,
             " guaranteed), ", f.hwpEpp ? "balanced" : "default", " preference");
     } else {
@@ -390,6 +393,32 @@ void initPowerStates() {
         log("[cpu]  c-states: idle in C1 (hlt)");
     else
         log("[cpu]  c-states: idle in ", NAMES[mwaitHint >> 4], " (MWAIT hint ", Hex{static_cast<u64>(mwaitHint), 2}, ")");
+}
+
+bool setPerformanceLimit(u32 percent) {
+    if (percent < 1)
+        percent = 1;
+    if (percent > 100)
+        percent = 100;
+    if (hwpOn) {
+        // The highest ratio HWP may pick, scaled between its lowest and highest.
+        u64 max = hwpLowest + (hwpHighest - hwpLowest) * percent / 100;
+        constexpr u64 BALANCED = 0x80;
+        return writeMsrSafe(Msr::HWP_REQUEST, hwpLowest | max << 8 | (f.hwpEpp ? BALANCED << 24 : 0));
+    }
+    if (f.intel and f.clockModulation) {
+        // On-demand clock modulation: the CPU runs `duty` of every 8 (or 16) slices.
+        constexpr u64 ENABLE = 1 << 4;
+        u32 steps = f.extendedClockModulation ? 16 : 8;
+        u32 duty = (percent * steps + 50) / 100;
+        if (duty >= steps)
+            return writeMsrSafe(Msr::CLOCK_MODULATION, 0);
+        if (duty < 1)
+            duty = 1;
+        u64 value = ENABLE | (f.extendedClockModulation ? duty : duty << 1); // (3-bit duty sits in bits 1-3)
+        return writeMsrSafe(Msr::CLOCK_MODULATION, value);
+    }
+    return false;
 }
 
 void idle() {

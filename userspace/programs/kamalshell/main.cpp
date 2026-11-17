@@ -1373,8 +1373,11 @@ private:
         if (p.temperature != Protocol::Power::UNKNOWN_TEMPERATURE) {
             Text<16> t;
             t.add(static_cast<long>(p.temperature / 10)).add("\xC2\xB0" "C");
-            bool hot = p.criticalTemperature != Protocol::Power::UNKNOWN_TEMPERATURE and
-                       p.temperature >= p.criticalTemperature - 100; // within 10 degrees of critical
+            bool throttled = p.performance and p.performance < 100; // (0: an older server)
+            if (throttled)
+                t.add(" ").add(static_cast<unsigned long>(p.performance)).add("%");
+            bool hot = throttled or (p.criticalTemperature != Protocol::Power::UNKNOWN_TEMPERATURE and
+                                     p.temperature >= p.criticalTemperature - 100); // within 10 degrees of critical
             x -= font.measure(t.cstr());
             c.text({x, textY}, t.cstr(), hot ? Theme::LOTUS : Theme::TEXT_DIM, font);
             x -= 18;

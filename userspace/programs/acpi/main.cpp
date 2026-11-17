@@ -400,6 +400,7 @@ uacpi_iteration_decision setUpEc(void*, uacpi_namespace_node* node, uacpi_u32) {
 // MARK: Batteries, AC adapter, thermal zones
 
 constexpr unsigned long UNKNOWN = 0xFFFFFFFF; // ACPI's "unknown" in battery packages
+long appliedLimit = 100; // the CPU performance cap passive cooling set, percent
 
 // Integers of a package a method returns (unknown or missing: UNKNOWN).
 bool packageIntegers(uacpi_namespace_node* node, char const* method, unsigned long* out, unsigned long count) {
@@ -478,6 +479,7 @@ Power::Status readStatus() {
     status.ac = -1;
     status.temperature = status.criticalTemperature = Power::UNKNOWN_TEMPERATURE;
     status.powerButtonPresses = powerButtonPresses;
+    status.performance = static_cast<unsigned char>(appliedLimit);
     Totals totals;
     totals.status = &status;
     uacpi_find_devices("PNP0C0A", readBattery, &totals);
@@ -528,6 +530,169 @@ void logStatus() {
         t.add(", no temperature reading");
     }
     Sys::log(t.cstr());
+}
+
+// MARK: Thermal policy (ACPI 6.5 section 11)
+//
+// Every thermal zone is read on its own schedule: _TZP (or every 5 s), and
+// every _TSP while passive cooling is on, plus at once when the firmware
+// notifies (0x80: the temperature changed, 0x81: the trip points changed).
+//   _CRT reached: the machine turns off (S5), before the hardware is hurt.
+//   _HOT reached: logged (it asks for S4, which Bhairav doesn't have).
+//   _PSV reached: passive cooling. The CPU's performance cap follows ACPI's
+//     formula, dP = _TC1 * (Tn - Tn-1) + _TC2 * (Tn - _PSV), every _TSP,
+//     until the zone is below _PSV and the cap is back at 100%.
+// shortcut: no active cooling (_ACx/_ALx fans): the embedded controller
+// runs the fans by itself on most laptops. Add it for machines that don't.
+
+constexpr unsigned long DEFAULT_POLL_MS = 5000;
+constexpr long MIN_PERFORMANCE = 10; // passive cooling never goes below this (percent)
+
+struct Zone {
+    uacpi_namespace_node* node = nullptr;
+    char name[5] = {};
+    long critical = -1, hot = -1, passive = -1; // tenths of a kelvin, -1 if absent
+    long tc1 = 0, tc2 = 0;
+    unsigned long samplingMs = 1000, pollingMs = DEFAULT_POLL_MS;
+    long last = -1;         // the previous reading, while cooling
+    long performance = 100; // this zone's cap, percent
+    bool hotLogged = false;
+    bool tripsChanged = false;
+};
+Zone zones[8];
+unsigned zoneCount = 0;
+bool thermalNow = false;          // a zone notified: check at once
+bool throttleUnavailable = false; // the kernel said the CPU can't be throttled
+unsigned long nextThermalCheck = 0;
+
+// A temperature method's value in tenths of a kelvin (100 K to 600 K), else -1.
+long kelvinTenths(uacpi_namespace_node* node, char const* method) {
+    uacpi_u64 v = 0;
+    if (uacpi_eval_simple_integer(node, method, &v) != UACPI_STATUS_OK or v < 1000 or v >= 6000)
+        return -1;
+    return static_cast<long>(v);
+}
+
+long integerOr(uacpi_namespace_node* node, char const* method, long otherwise) {
+    uacpi_u64 v = 0;
+    return uacpi_eval_simple_integer(node, method, &v) == UACPI_STATUS_OK ? static_cast<long>(v) : otherwise;
+}
+
+Text<120>& addCelsius(Text<120>& t, long kelvin) {
+    long c = kelvin - 2732;
+    return t.add(c / 10).add(".").add((c % 10 + 10) % 10).add(" C");
+}
+
+void readTrips(Zone& z) {
+    z.critical = kelvinTenths(z.node, "_CRT");
+    z.hot = kelvinTenths(z.node, "_HOT");
+    z.passive = kelvinTenths(z.node, "_PSV");
+    z.tc1 = integerOr(z.node, "_TC1", -1);
+    z.tc2 = integerOr(z.node, "_TC2", -1);
+    if (z.passive >= 0 and (z.tc1 < 0 or z.tc2 < 0)) {
+        z.passive = -1; // (the formula needs both constants)
+        Sys::log("acpi: thermal: a zone has _PSV without _TC1/_TC2: no passive cooling there");
+    }
+    long tsp = integerOr(z.node, "_TSP", 10), tzp = integerOr(z.node, "_TZP", 0); // tenths of a second
+    z.samplingMs = static_cast<unsigned long>(tsp < 1 ? 1 : tsp > 600 ? 600 : tsp) * 100;
+    z.pollingMs = tzp > 0 ? static_cast<unsigned long>(tzp > 600 ? 600 : tzp) * 100 : DEFAULT_POLL_MS;
+    Text<120> t;
+    t.add("acpi: thermal zone ").add(z.name).add(": critical ");
+    if (z.critical >= 0)
+        addCelsius(t, z.critical);
+    else
+        t.add("none");
+    if (z.hot >= 0)
+        addCelsius(t.add(", hot "), z.hot);
+    if (z.passive >= 0)
+        addCelsius(t.add(", passive "), z.passive).add(" (tc1 ").add(z.tc1).add(", tc2 ").add(z.tc2).add(")");
+    Sys::log(t.cstr());
+}
+
+uacpi_status onZoneNotify(uacpi_handle context, uacpi_namespace_node*, uacpi_u64 value) {
+    auto* z = static_cast<Zone*>(context);
+    if (value == 0x81)
+        z->tripsChanged = true;
+    if (value == 0x80 or value == 0x81)
+        thermalNow = true;
+    return UACPI_STATUS_OK;
+}
+
+uacpi_iteration_decision addZone(void*, uacpi_namespace_node* node, uacpi_u32) {
+    if (zoneCount == sizeof(zones) / sizeof(zones[0]))
+        return UACPI_ITERATION_DECISION_BREAK;
+    Zone& z = zones[zoneCount++];
+    z.node = node;
+    uacpi_object_name n = uacpi_namespace_node_name(node);
+    for (int i = 0; i < 4; i++)
+        z.name[i] = n.text[i];
+    for (int i = 3; i > 0 and z.name[i] == '_'; i--)
+        z.name[i] = 0; // (ACPI pads names with '_')
+    readTrips(z);
+    uacpi_install_notify_handler(node, onZoneNotify, &z);
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+void startThermalPolicy() {
+    uacpi_namespace_for_each_child(uacpi_namespace_root(), addZone, nullptr, UACPI_OBJECT_THERMAL_ZONE_BIT,
+                                   UACPI_MAX_DEPTH_ANY, nullptr);
+    if (zoneCount)
+        thermalNow = true;
+}
+
+// Reads every zone and acts. Returns how long until the next check (ms).
+unsigned long checkThermal() {
+    unsigned long next = DEFAULT_POLL_MS;
+    long limit = 100;
+    for (unsigned i = 0; i < zoneCount; i++) {
+        Zone& z = zones[i];
+        if (z.tripsChanged) {
+            z.tripsChanged = false;
+            readTrips(z);
+        }
+        long t = kelvinTenths(z.node, "_TMP");
+        if (t < 0)
+            continue;
+        if (z.critical >= 0 and t >= z.critical) {
+            Text<120> m;
+            addCelsius(addCelsius(m.add("acpi: thermal: ").add(z.name).add(" is at "), t).add(", past its critical "),
+                       z.critical);
+            Sys::log(m.cstr());
+            powerOff("critical temperature");
+        }
+        if (z.hot >= 0 and t >= z.hot and not z.hotLogged) {
+            Text<120> m;
+            addCelsius(addCelsius(m.add("acpi: thermal: ").add(z.name).add(" is at "), t).add(", past its hot "), z.hot)
+                .add(" (asks for S4, which Bhairav lacks)");
+            Sys::log(m.cstr());
+        }
+        z.hotLogged = z.hot >= 0 and t >= z.hot;
+        if (z.passive >= 0 and (t >= z.passive or z.performance < 100)) {
+            long previous = z.last < 0 ? t : z.last;
+            long reduce = (z.tc1 * (t - previous) + z.tc2 * (t - z.passive)) / 10; // (tenths of a kelvin)
+            z.performance -= reduce;
+            z.performance = z.performance < MIN_PERFORMANCE ? MIN_PERFORMANCE : z.performance > 100 ? 100 : z.performance;
+            z.last = z.performance < 100 ? t : -1;
+        }
+        if (z.performance < limit)
+            limit = z.performance;
+        unsigned long interval = z.performance < 100 ? z.samplingMs : z.pollingMs;
+        if (interval < next)
+            next = interval;
+    }
+    if (limit != appliedLimit) {
+        long r = throttleUnavailable ? Sys::NOT_FOUND : Sys::firmwarePerformance(FIRMWARE, static_cast<unsigned long>(limit));
+        Text<120> m;
+        m.add("acpi: thermal: passive cooling ").add(limit < 100 ? "caps the CPU at " : "over: the CPU back at ").add(limit)
+            .add("%");
+        if (r == Sys::NOT_FOUND and not throttleUnavailable)
+            m.add(" (this CPU can't be throttled: no HWP, no clock modulation)");
+        if (r == Sys::NOT_FOUND)
+            throttleUnavailable = true;
+        Sys::log(m.cstr());
+        appliedLimit = limit;
+    }
+    return next;
 }
 
 } // namespace
@@ -787,6 +952,7 @@ int main() {
     bool haveSci = Sys::irqBind(SCI, sciEnd.handle(), 1) == Sys::OK;
     Sys::log(haveSci ? "acpi: listening for ACPI events (SCI)" : "acpi: no SCI line of its own: no ACPI events");
     logStatus();
+    startThermalPolicy();
 
     Channel shell(SHELL);
     bool haveShell = true;
@@ -802,9 +968,14 @@ int main() {
             handles[count] = sci.handle();
             owners[count++] = 1;
         }
-        long ready = count ? Sys::wait(handles, count, Sys::WAIT_FOREVER) : Sys::TIMED_OUT;
+        // Wake for a message, or for the next thermal check.
+        unsigned long now = Sys::timeMs();
+        unsigned long timeout = not zoneCount              ? Sys::WAIT_FOREVER
+                                : thermalNow or now >= nextThermalCheck ? 0
+                                                                        : nextThermalCheck - now;
+        long ready = count ? Sys::wait(handles, count, timeout) : Sys::TIMED_OUT;
         if (count == 0)
-            Sys::sleep(60 * 1000);
+            Sys::sleep(zoneCount ? timeout : 60 * 1000);
         if (ready >= 0 and owners[ready] == 1) { // the SCI: uACPI reads and clears what happened
             Sys::IrqMessage message;
             sci.recv(message);
@@ -826,6 +997,10 @@ int main() {
             powerButtonPresses++;
             powerButton = false;
             powerOff("power button pressed");
+        }
+        if (zoneCount and (thermalNow or Sys::timeMs() >= nextThermalCheck)) {
+            thermalNow = false;
+            nextThermalCheck = Sys::timeMs() + checkThermal();
         }
     }
 }

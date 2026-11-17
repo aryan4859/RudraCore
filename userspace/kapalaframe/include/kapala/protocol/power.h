@@ -34,6 +34,7 @@ struct Status {
     short temperature;         // the hottest zone, tenths of a degree Celsius (UNKNOWN_TEMPERATURE)
     short criticalTemperature; // its _CRT, the same way
     unsigned powerButtonPresses; // since boot (the shell may ask the user first)
+    unsigned char performance;   // the CPU cap passive cooling set, percent (100: not throttled)
 };
 
 static_assert(sizeof(Status) <= 128, "must fit in a channel message");

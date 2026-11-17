@@ -410,10 +410,10 @@ One module, `arch/x86_64/acpi.{h,cpp}`, replaces the IOMMU's private table walk.
 | Battery and thermal information | Without an AML interpreter, `_BST`/`_BIF`/`_TMP` can't be evaluated. The kernel reports what the DSDT/SSDTs declare: battery devices (EisaId PNP0C0A) and ThermalZone objects. | QEMU: 0 and 0, reported as "readings need an AML interpreter: not available". |
 
 **Limits.**
-- No AML interpreter: no battery or thermal readings, no sleep states other than S5, no `_PTS` before S5, no `_PRT` interrupt routing (devices keep using the legacy PIC). `_S5` is found by pattern, which covers the common encodings (ZeroOp, OneOp, BytePrefix).
+- The kernel itself has no AML interpreter: the acpi server does that work (§17-§20). The kernel's own S5 is the fallback, with `_S5` found by pattern, which covers the common encodings (ZeroOp, OneOp, BytePrefix).
 - Hardware-reduced ACPI machines (no PM1 blocks) can't be powered off this way, and the log says so.
 - Before powering off, nothing is told to close: the fs server writes every change before it replies, so no data waits in memory, but open apps aren't asked to save.
-- The parsed MADT, HPET, MCFG and SRAT data isn't used yet (PIC, PIT and port-based PCI configuration stay). It's in place for an APIC, HPET or ECAM switch.
+- The MADT drives the APICs (§18), and the FADT's PM timer calibrates the TSC. The HPET, MCFG and SRAT data isn't used yet: the PIT and port-based PCI configuration stay, and the kernel uses one CPU.
 - Damaged-table handling (skip and count) was checked by code review only: QEMU fixes the checksums of the tables it builds.
 
 ## 17. The ACPI server (AML interpreter)
@@ -466,10 +466,12 @@ Step 3 of 4 (§17).
 | Thermal | Every ThermalZone's `_TMP` (tenths of a kelvin, accepted from 100 K to 600 K), the hottest one reported with its `_CRT`. | Test SSDT: "45.0 C (critical at 100 C)". |
 | KamalShell | A power channel to the acpi server (`protocol/power.h`), set up by init. The shell asks every 5 seconds and the answer joins its wait loop. The top bar shows a battery icon with the percentage ("+" when charging; red when critical or at 10% or less) and the temperature (red within 10 °C of critical). With no acpi server (safe mode, no ACPI), the channel is closed and nothing is shown. | Screenshot with the test SSDT: battery 75% +, 45°C. Safe mode: KamalShell runs without the server. |
 
+| Thermal policy | The acpi server watches every thermal zone (`_TZP`, or every 5 s; every `_TSP` while cooling; at once on Notify 0x80/0x81, which also re-reads the trip points). At `_CRT` it turns the machine off (S5, the ACPI way). At `_HOT` it logs once: that point asks for S4, which Bhairav lacks. At `_PSV` passive cooling starts with ACPI's formula, ΔP = `_TC1`·(Tn − Tn−1) + `_TC2`·(Tn − `_PSV`). It continues until the zone is below `_PSV` and the cap is back at 100% (never below 10%). The cap goes to the kernel (`SYS_FIRMWARE_PERFORMANCE`, firmware handle, RIGHT_WRITE). There it limits HWP's highest ratio, or, without HWP, uses Intel on-demand clock modulation (IA32_CLOCK_MODULATION, 8 or 16 steps). A `_PSV` without `_TC1`/`_TC2` gets no passive cooling (logged). KamalShell shows the cap next to the temperature, in red. | Test SSDT (`scripts/thermal-test.asl`, `make shot THERMAL_TEST=1`): the zone warms past 70 C (cap 70%, then 54%), cools (71%, then "back at 100%"), then climbs: 10%, "past its hot 85.0 C", "past its critical 90.0 C", S5, and QEMU exits. QEMU's CPU has neither HWP nor clock modulation, so the log says it can't be throttled. |
+
 **Limits.**
+- Thermal throttling has been tested only as policy: the kernel's HWP and clock-modulation paths haven't run on hardware. No active cooling (`_ACx`/`_ALx` fans): on most laptops the embedded controller runs the fans itself. Only the CPU the kernel runs on is capped (the kernel uses one CPU).
 - The power button turns the machine off at once, without asking open apps to save (the fs server keeps no unwritten data).
 - No EC query events (`_Qxx`): battery and temperature are read when asked (every 5 s), not on notification. No ECDT (an EC needed before the namespace loads).
-- No thermal policy: nothing is throttled or shut down at `_PSV`/`_HOT`/`_CRT`. The shell only colours the reading.
 - The SCI can't share a line with a driver's interrupt (one owner per line): then there are no events, and the log says so.
 - Battery percentage mixes units if two batteries report different ones (mWh and mAh). Rare.
 

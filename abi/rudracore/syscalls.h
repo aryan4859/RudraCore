@@ -132,6 +132,10 @@ enum Syscall : unsigned long {
                             //   fallback). KamalShell calls it once the desktop has run a while.
                             //   Root and System programs only (ACCESS_DENIED). NOT_FOUND without
                             //   UEFI runtime services (BIOS boot); IO_ERROR if the firmware failed.
+    SYS_FIRMWARE_PERFORMANCE = 46, // (Handle firmware, u64 percent 1-100), RIGHT_WRITE: the acpi
+                                   //   server's thermal throttling (passive cooling) caps the CPU at
+                                   //   that share of its performance; 100 lifts the cap. NOT_FOUND if
+                                   //   the CPU has no way (no HWP, no clock modulation).
 };
 
 constexpr unsigned long INTERRUPTS_ROUTE = 1, INTERRUPTS_APIC = 2;
