@@ -45,7 +45,8 @@ void timerResolution() {
     Sys::sleep(5);
     unsigned long slept = (Sys::timeNs() - start) / 1000;
     report("sleep(5 ms) took", slept, "us");
-    expect("a 5 ms sleep lasts 5-15 ms", slept >= 4900 and slept < 15000, static_cast<long>(slept));
+    // Never early (how late depends on the load, and in an emulator on the host).
+    expect("a 5 ms sleep never ends early", slept >= 4900, static_cast<long>(slept));
 }
 
 constexpr int ROUND_TRIPS = 2000;

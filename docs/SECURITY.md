@@ -546,4 +546,18 @@ A process (`core/process.{h,cpp}`) holds the address space, handles, quota, regi
 - **Panic:** stops every other CPU.
 - **Tested (`SMP=4`):** 4 CPUs come up, and every boot check passes, including thread-test and harden-test. 1000 IPC round trips take 106 ms, against 2.3 s on 1 CPU. 1 CPU still passes everything.
 
+**Performance (step 4.4).**
+- **Instrumentation:** `core/counters.h` keeps relaxed-atomic counters: system calls, interrupts, page faults, switches with their TSC time, kernel-lock acquisitions, contended waits and wait time, IPIs, shootdowns, and kernel heap allocations with their time. `kernel_counters` reads them.
+- **Timer resolution:** `time_ns` is the TSC in nanoseconds.
+- **Fairness:** a wake-up jumps the queue at most once per time slice.
+- **perf-test** (every boot) measures and reports:
+  - timer resolution and sleep accuracy (a sleep must never end early)
+  - IPC round-trip latency
+  - context-switch cost
+  - private-memory and heap allocation cost
+  - fairness: the least-served spinner must get at least a quarter of the busiest's share
+  - kernel-lock contention
+- **Stress test** (part of perf-test): 8 threads share a mutex-protected list, the heap and yields. Every item is checksummed and accounted for, and each join has a 30 s deadline, so a deadlock fails the test.
+- **Results:** 21/21 on 1 CPU. On 4 CPUs under QEMU's software emulation, the stress test passes, fairness is 36% (94% on 1 CPU), and the kernel lock is contended in 34% of acquisitions during the stress test. That contention is the main scaling limit.
+
 **Limits.** It's one big kernel lock, not fine-grained locking: kernel work doesn't scale across CPUs. Up to 16 CPUs, xAPIC only. MTRRs are left as the firmware set them, and machine-check banks are set up only on the boot CPU. Not tried on real hardware.
