@@ -41,6 +41,7 @@ constexpr u8 USER_INTERRUPT_GATE = 0xEE; // same, but callable from ring 3
 
 constexpr u64 VECTOR_BREAKPOINT = 3;
 constexpr u64 VECTOR_PAGE_FAULT = 14;
+constexpr u64 VECTOR_MACHINE_CHECK = 18;
 constexpr u64 VECTOR_IRQ_BASE = Pic::IRQ_BASE;
 
 alignas(16) Entry entries[256];
@@ -98,6 +99,11 @@ void logRegisters(Frame const& f) {
     if (f.vector == 8)
         log("(a fault while handling a fault: most often a kernel stack overflow into its guard page, at ",
             Hex{readCr2()}, ")");
+
+    if (f.vector == VECTOR_MACHINE_CHECK) {
+        log("(the hardware reported an error it couldn't correct: memory, cache or bus)");
+        Cpu::reportMachineCheck();
+    }
 
     if (f.vector == VECTOR_PAGE_FAULT) {
         log("");
@@ -169,8 +175,11 @@ extern "C" Frame* interruptDispatch(Frame* frame) {
         return frame;
     }
 
+    if (Cpu::recoverMsrFault(*frame))
+        return frame; // readMsrSafe/writeMsrSafe probed an MSR this CPU lacks
+
     if (vector < 32) {
-        if (fromUser) {
+        if (fromUser and vector != Idt::VECTOR_MACHINE_CHECK) { // (#MC is the machine's, not the task's)
             Idt::logUserFault(*frame);
             return Sched::exitCurrent(frame, -1);
         }
@@ -182,7 +191,7 @@ extern "C" Frame* interruptDispatch(Frame* frame) {
         return Sched::onTimerTick(frame);
     }
 
-    if (vector > Idt::VECTOR_IRQ_BASE and vector < Idt::VECTOR_IRQ_BASE + 16) {
+    if (vector > Idt::VECTOR_IRQ_BASE and vector < Idt::VECTOR_IRQ_BASE + Core::Irq::LINES) { // pins, then MSI
         u8 irq = static_cast<u8>(vector - Idt::VECTOR_IRQ_BASE);
         if (Pic::isSpurious(irq))
             return frame;

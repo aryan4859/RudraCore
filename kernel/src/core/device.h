@@ -1,5 +1,6 @@
 #pragma once
 
+#include "arch/x86_64/msi.h"
 #include "arch/x86_64/pci.h"
 #include "core/object.h"
 
@@ -16,15 +17,29 @@ struct Endpoint;
 // when the driver waits again (irq_wait) or acknowledges (irq_ack). So a
 // driver is never interrupted by its own device mid-work, at most one
 // notification is ever in flight, and none are lost.
+//
+// Lines 0-15 are pins (PIC / I/O APIC); 16-31 are message-signalled
+// interrupts (MSI/MSI-X), one per device, at vector 32 + line like the
+// rest. A message that can't be masked at the device and arrives while
+// the driver is busy is held as pending.
 struct Irq : public Object {
+    static constexpr u8 LINES = 32, FIRST_MSI = 16;
+
     u8 line;
     bool pending = false;     // fired, but not yet seen by the driver
+    bool masked = true;
     Task* waiter = nullptr;   // a task blocked in irq_wait
     Endpoint* bound = nullptr; // messages go out from here (holds a reference)
     u64 cookie = 0;
+    Arch::Msi::Vector msi{};  // lines >= FIRST_MSI
 
     explicit Irq(u8 line);
     ~Irq() override;
+
+    // A message-signalled interrupt for `device`, or nullptr (error set:
+    // NOT_FOUND if it has no MSI/MSI-X or the APICs are off, ALREADY_EXISTS
+    // if it has one already, NO_SPACE if all MSI lines are taken).
+    static Irq* forDevice(Arch::Pci::Address device, i64& error);
 
     // Called from the interrupt handler. Returns false if no driver owns
     // the line.
@@ -32,6 +47,9 @@ struct Irq : public Object {
 
     // Whether some Irq object already owns the line (one owner per line).
     static bool owned(u8 line);
+
+    void mask();
+    void unmask();
 
     // Sends the notification message if the line is bound. Returns false
     // if it couldn't be queued (it stays pending and is retried on ack).

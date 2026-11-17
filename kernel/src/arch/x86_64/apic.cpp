@@ -54,15 +54,6 @@ void writeEntry(u32 input, u32 low, u32 high) {
     ioWrite(REDIRECTION + 2 * input, low);
 }
 
-u64 readMsr(u32 msr) {
-    u32 lo, hi;
-    asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
-    return u64{hi} << 32 | lo;
-}
-void writeMsr(u32 msr, u64 value) {
-    asm volatile("wrmsr" : : "c"(msr), "a"(static_cast<u32>(value)), "d"(static_cast<u32>(value >> 32)));
-}
-
 // One I/O APIC input feeding `line`. With remapping, the entry is in the
 // remappable format, its index the input number.
 bool route(u32 gsi, u8 line, bool level, bool activeLow) {
@@ -118,8 +109,7 @@ bool enable() {
 
     // The local APIC: on (IA32_APIC_BASE bit 11, then the spurious vector
     // register), all priorities accepted.
-    constexpr u32 APIC_BASE_MSR = 0x1B;
-    writeMsr(APIC_BASE_MSR, readMsr(APIC_BASE_MSR) | (1u << 11));
+    writeMsr(Msr::APIC_BASE, readMsr(Msr::APIC_BASE) | (1u << 11));
     lapic = static_cast<u32 volatile*>(Acpi::map(m.localApic, 4096, Vmm::Cache::Uncached));
     ioapic = static_cast<u32 volatile*>(Acpi::map(m.ioApic, 4096, Vmm::Cache::Uncached));
     apicId = static_cast<u8>(lapicRead(LAPIC_ID) >> 24);
@@ -172,6 +162,8 @@ bool enable() {
 }
 
 bool active() { return on; }
+
+u8 localId() { return apicId; }
 
 void mask(u8 line) {
     for (u32 i = 0; i < inputs; i++) {

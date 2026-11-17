@@ -299,10 +299,8 @@ void exit(i64 code) {
 }
 
 void idle() {
-    for (;;) {
-        Arch::enableInterrupts();
-        Arch::waitForInterrupt();
-    }
+    for (;;)
+        Arch::Cpu::idle();
 }
 
 Arch::Frame* switchFrom(Arch::Frame* frame) {

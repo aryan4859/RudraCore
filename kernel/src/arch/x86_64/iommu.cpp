@@ -321,12 +321,10 @@ void init(Boot::Info const& info) {
 
     // Interrupt remapping. A device write to 0xFEExxxxx isn't DMA but an
     // interrupt message, which DMA remapping lets through: a driver's device
-    // could raise any vector, an NMI or an SMI. Every interrupt here comes
-    // through the legacy PIC (wires, not messages), so no device needs to
-    // send one: the table is all not-present, and compatibility-format
+    // could raise any vector, an NMI or an SMI. The table starts all
+    // not-present; the I/O APIC's pins and each driver's MSI get entries
+    // checked against their requester id (SVT/SID). Compatibility-format
     // messages stay blocked (GCMD.CFI clear). Each blocked one is logged.
-    // shortcut: no entries yet; when a driver uses MSI, give its device
-    // entries with source-id checking (SVT/SID) instead of blocking all.
     interruptTable = interruptRemapping ? Pmm::allocZeroed() : 0;
     if (not interruptTable) {
         log("[iommu] no interrupt remapping: a device could still send interrupt messages (MSI)");
@@ -343,7 +341,7 @@ void init(Boot::Info const& info) {
     invalidateInterruptEntries();
     remapping = on;
     if (on)
-        log("[iommu] interrupt remapping on: devices can't send interrupt messages (only the I/O APIC gets entries)");
+        log("[iommu] interrupt remapping on: a device sends interrupt messages only through its own entries");
     else
         log("[iommu] interrupt remapping didn't turn on (or lets compatibility-format messages through)");
 }
@@ -354,18 +352,44 @@ bool enabled() {
 
 bool remapsInterrupts() { return remapping; }
 
-bool remapIoapicPin(u32 index, u8 vector, bool level, u8 destination) {
-    if (not remapping or not queued or not haveIoapicSource or index >= 256)
+// Entry `index`: only requester `source` (checked, SVT = 1) may use it.
+static bool setEntry(u32 index, u16 source, u8 vector, bool level, u8 destination) {
+    if (not remapping or not queued or index >= 256)
         return false;
     InterruptGuard guard;
     u64* e = table(interruptTable) + 2 * index;
-    // High half first: only the I/O APIC (requester id checked, SVT = 1) may
-    // use this entry. Then the low half, present last.
-    e[1] = ioapicSource | (1ull << 18);
+    // Not present while it changes, then the high half (who may use it),
+    // then the low half, present last.
+    e[0] = 0;
+    flush(e);
+    invalidateInterruptEntries();
+    e[1] = source | (1ull << 18);
     e[0] = 1 | (level ? 1ull << 4 : 0) | static_cast<u64>(vector) << 16 | static_cast<u64>(destination) << 40;
     flush(e);
     invalidateInterruptEntries();
     return true;
+}
+
+bool remapIoapicPin(u32 index, u8 vector, bool level, u8 destination) {
+    return haveIoapicSource and setEntry(index, ioapicSource, vector, level, destination);
+}
+
+// shortcut: the requester id is the function's own; a device behind a
+// PCIe-to-PCI bridge sends with the bridge's, and its MSI would be blocked
+// (logged). Upgrade with the bridge walk when such a device needs MSI.
+bool remapMsi(u32 index, Pci::Address device, u8 vector, u8 destination) {
+    u16 source = static_cast<u16>(device.bus << 8 | device.device << 3 | device.function);
+    return setEntry(index, source, vector, false, destination);
+}
+
+void removeEntry(u32 index) {
+    if (not remapping or not queued or index >= 256)
+        return;
+    InterruptGuard guard;
+    u64* e = table(interruptTable) + 2 * index;
+    e[0] = 0;
+    flush(e);
+    invalidateInterruptEntries();
 }
 
 bool allow(Pci::Address device, u64 physical, u64 size) {

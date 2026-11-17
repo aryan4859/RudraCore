@@ -1,5 +1,6 @@
 #include "core/device.h"
 
+#include "arch/x86_64/cpu.h"
 #include "arch/x86_64/pic.h"
 #include "core/channel.h"
 #include "core/sched.h"
@@ -12,18 +13,50 @@ namespace Rudracore::Core {
 
 namespace {
 
-Irq* owners[16] = {};
+Irq* owners[Irq::LINES] = {};
+
+bool same(Arch::Pci::Address a, Arch::Pci::Address b) {
+    return a.bus == b.bus and a.device == b.device and a.function == b.function;
+}
 
 } // namespace
 
 Irq::Irq(u8 line) : Object(ObjectType::Irq), line(line) {
-    if (line >= 16 or owners[line])
+    if (line >= LINES or owners[line])
         panic("irq: line out of range or already owned");
     owners[line] = this;
 }
 
+Irq* Irq::forDevice(Arch::Pci::Address device, i64& error) {
+    Arch::InterruptGuard guard;
+    u8 line = 0;
+    for (u8 l = FIRST_MSI; l < LINES; l++) {
+        if (owners[l] and same(owners[l]->msi.device, device)) {
+            error = Abi::ALREADY_EXISTS;
+            return nullptr;
+        }
+        if (not owners[l] and not line)
+            line = l;
+    }
+    if (not line) {
+        error = Abi::NO_SPACE;
+        return nullptr;
+    }
+    auto* irq = new Irq(line);
+    // VT-d entries 0-127 are the I/O APIC's pins; MSI lines use 128 + line.
+    if (not Arch::Msi::enable(device, static_cast<u8>(Arch::Pic::IRQ_BASE + line), 128u + line, irq->msi)) {
+        irq->unref();
+        error = Abi::NOT_FOUND;
+        return nullptr;
+    }
+    irq->mask(); // until the driver binds or waits
+    return irq;
+}
+
 Irq::~Irq() {
-    Arch::Pic::mask(line);
+    mask();
+    if (line >= FIRST_MSI)
+        Arch::Msi::disable(msi);
     owners[line] = nullptr;
     if (bound)
         bound->unref();
@@ -45,14 +78,34 @@ bool Irq::notify() {
     return true;
 }
 
-bool Irq::owned(u8 line) { return line < 16 and owners[line]; }
+bool Irq::owned(u8 line) { return line < LINES and owners[line]; }
+
+void Irq::mask() {
+    masked = true;
+    if (line < FIRST_MSI)
+        Arch::Pic::mask(line);
+    else
+        Arch::Msi::setMasked(msi, true);
+}
+
+void Irq::unmask() {
+    masked = false;
+    if (line < FIRST_MSI)
+        Arch::Pic::unmask(line);
+    else
+        Arch::Msi::setMasked(msi, false);
+}
 
 bool Irq::deliver(u8 line) {
-    Irq* irq = line < 16 ? owners[line] : nullptr;
+    Irq* irq = line < LINES ? owners[line] : nullptr;
     if (not irq)
         return false;
 
-    Arch::Pic::mask(line);
+    if (irq->masked) { // a message the device couldn't hold back: keep it for later
+        irq->pending = true;
+        return true;
+    }
+    irq->mask();
     if (irq->bound) {
         irq->pending = not irq->notify();
         return true;
@@ -73,7 +126,7 @@ void Irq::bind(Endpoint* endpoint, u64 newCookie) {
     bound = endpoint;
     cookie = newCookie;
     pending = false;
-    Arch::Pic::unmask(line);
+    unmask();
 }
 
 void Irq::acknowledge() {
@@ -84,7 +137,7 @@ void Irq::acknowledge() {
         if (not pending)
             return;
     }
-    Arch::Pic::unmask(line);
+    unmask();
 }
 
 PciDevice::PciDevice(Arch::Pci::Address a) : Object(ObjectType::PciDevice), address(a) {

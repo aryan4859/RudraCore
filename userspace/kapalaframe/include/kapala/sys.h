@@ -166,6 +166,10 @@ inline long deviceInfo(Handle device, DeviceInfo& out) { return syscall(SYS_DEVI
 // Returns a shared memory handle for memory BAR `index`, or a negative Error.
 inline long deviceBar(Handle device, unsigned long index) { return syscall(SYS_DEVICE_BAR, device, index); }
 
+// A handle to the device's message-signalled interrupt (MSI/MSI-X), used like
+// any IRQ handle, or a negative Error (NOT_FOUND: no MSI here; use the pin).
+inline long deviceMsi(Handle device) { return syscall(SYS_DEVICE_MSI, device); }
+
 // Physical address of shared memory, for the device to use (DMA).
 inline long dmaAddress(Handle device, Handle memory) { return syscall(SYS_DMA_ADDRESS, device, memory); }
 

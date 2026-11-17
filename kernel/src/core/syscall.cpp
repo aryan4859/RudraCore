@@ -810,7 +810,7 @@ Arch::Frame* sysIrqWait(Call const& c) {
 
     // The driver has finished with the last interrupt: let the next one in.
     irq->waiter = c.task;
-    Arch::Pic::unmask(irq->line);
+    irq->unmask();
     return c.blockAndRetry();
 }
 
@@ -900,6 +900,28 @@ Arch::Frame* sysDeviceBar(Call const& c) {
         return c.result(Abi::NO_SPACE);
     }
     device->enable();
+    return c.result(static_cast<i64>(handle));
+}
+
+// The device's message-signalled interrupt, as an IRQ handle. Programming
+// it is the kernel's job (vector, destination, remapping entry); the driver
+// only gets the handle. Needs RIGHT_MMIO: it's control of the device.
+Arch::Frame* sysDeviceMsi(Call const& c) {
+    i64 error = 0;
+    auto* device = c.lookup<Core::PciDevice>(c.arg0(), ObjectType::PciDevice, Abi::RIGHT_MMIO, error);
+    if (not device)
+        return c.result(error);
+    auto* irq = Core::Irq::forDevice(device->address, error);
+    if (not irq)
+        return c.result(error);
+    u64 handle = c.task->addHandle({irq, Abi::RIGHT_READ, 0});
+    if (not handle) {
+        irq->unref();
+        return c.result(Abi::NO_SPACE);
+    }
+    log("[pci]  ", device->address.bus, ":", device->address.device, ".", device->address.function, " interrupts by ",
+        irq->msi.msix ? "MSI-X" : "MSI", " (vector ", Arch::Pic::IRQ_BASE + irq->line,
+        Arch::Iommu::remapsInterrupts() ? ", through its own VT-d remapping entry)" : ")");
     return c.result(static_cast<i64>(handle));
 }
 
@@ -1100,6 +1122,7 @@ Arch::Frame* dispatch(Arch::Frame* frame) {
     case Abi::SYS_PORT_IN_WIDE: return sysPortWide(c, false);
     case Abi::SYS_PORT_OUT_WIDE: return sysPortWide(c, true);
     case Abi::SYS_FIRMWARE_INTERRUPTS: return sysFirmwareInterrupts(c);
+    case Abi::SYS_DEVICE_MSI: return sysDeviceMsi(c);
 
     default: return c.result(Abi::UNKNOWN_SYSCALL);
     }

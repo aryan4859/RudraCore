@@ -13,7 +13,8 @@
 //   };
 //
 // Handles every driver gets from init: 1 the PCI device, 2 a channel to the
-// net server, 3 the interrupt (optional; without it the card is polled).
+// net server, 3 the interrupt pin (optional; the card's MSI is preferred,
+// and without either the card is polled).
 
 #include <kapala/channel.h>
 #include <kapala/protocol/netdev.h>
@@ -61,9 +62,12 @@ int runNetDriver(Card& card, char const* name) {
     bool up = card.linkUp();
     sendInfo(up);
 
+    // The card's MSI when it has one (and the APICs are on), else its pin.
+    long msi = Sys::deviceMsi(DEVICE);
+    Sys::Handle irq = msi > 0 ? static_cast<Sys::Handle>(msi) : IRQ;
     Channel irqEvents, irqSource;
     bool haveIrq = Channel::createPair(irqEvents, irqSource) == Sys::OK and
-                   Sys::irqBind(IRQ, irqSource.handle(), 1) == Sys::OK;
+                   Sys::irqBind(irq, irqSource.handle(), 1) == Sys::OK;
     {
         Text<> t;
         static constexpr char HEX[] = "0123456789abcdef";
@@ -72,7 +76,8 @@ int runNetDriver(Card& card, char const* name) {
             char b[3] = {HEX[card.mac()[i] >> 4], HEX[card.mac()[i] & 15], 0};
             t.add(b).add(i < 5 ? ":" : "");
         }
-        t.add(up ? ", link up" : ", link down").add(haveIrq ? "" : ", polling (no interrupt)");
+        t.add(up ? ", link up" : ", link down")
+            .add(not haveIrq ? ", polling (no interrupt)" : msi > 0 ? ", interrupts by MSI" : "");
         Sys::log(t.cstr());
     }
 
@@ -94,7 +99,7 @@ int runNetDriver(Card& card, char const* name) {
             Sys::IrqMessage message;
             irqEvents.recv(message);
             card.acknowledgeInterrupt();
-            Sys::irqAck(IRQ);
+            Sys::irqAck(irq);
         }
 
         bool received = false;

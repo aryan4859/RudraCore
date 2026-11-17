@@ -1,5 +1,6 @@
 #include "arch/x86_64/acpi.h"
 #include "arch/x86_64/fpu.h"
+#include "arch/x86_64/frame.h"
 #include "arch/x86_64/gdt.h"
 #include "arch/x86_64/idt.h"
 #include "arch/x86_64/io.h"
@@ -28,6 +29,9 @@
 #include "serial.h"
 
 using namespace Rudracore;
+
+// readMsrSafe's rdmsr and where it resumes (cpu.cpp), for the self-test.
+extern "C" char const msrReadInstruction[], msrReadResume[];
 
 // Global constructors, collected by the linker script.
 extern "C" void (*__init_array_start[])();
@@ -78,6 +82,19 @@ void logMemory(char const* label) {
 void testInterrupts() {
     asm volatile("int3");
     log("[cpu]  interrupt round-trip ok");
+    // The MSR fault fix-up, on a made-up #GP at readMsrSafe's rdmsr: it
+    // must resume after it with "not there". Then a real probe of a
+    // reserved MSR (which some hypervisors answer with 0 instead of #GP).
+    Arch::Frame fake{};
+    fake.vector = 13;
+    fake.cs = Arch::Gdt::KERNEL_CODE;
+    fake.rip = reinterpret_cast<u64>(msrReadInstruction);
+    fake.rsi = 1;
+    if (not Arch::Cpu::recoverMsrFault(fake) or fake.rip != reinterpret_cast<u64>(msrReadResume) or fake.rsi != 0)
+        panic("selftest: the MSR fault fix-up doesn't resume readMsrSafe");
+    u64 value;
+    bool present = Arch::Cpu::readMsrSafe(0x0000DEAD, value);
+    log("[cpu]  msr fault fix-up ok; a reserved MSR ", present ? "reads as 0 here (not faulting)" : "faulted and was recovered");
 }
 
 // Allocates pages, maps one at a fresh address, checks the data is visible
@@ -376,6 +393,7 @@ extern "C" [[noreturn]] void kmain(u64 bootMagic, u64 bootInfo) {
         panic("boot: memory map validation repaired a broken test map wrongly");
     log("[boot] memory map validation ok (a broken test map was repaired correctly)");
 
+    Arch::Cpu::init(); // panics on a CPU missing what the rest assumes
     Arch::Gdt::init();
     Arch::Idt::init();
     Arch::Pic::init();
@@ -383,6 +401,7 @@ extern "C" [[noreturn]] void kmain(u64 bootMagic, u64 bootInfo) {
     Arch::Protect::init();
     log("[cpu]  gdt + tss loaded, idt ready (256 vectors), pic remapped and masked, sse on");
     testInterrupts();
+    Arch::Cpu::enableMachineChecks();
 
     Pmm::init(info);
     Vmm::init(info);
@@ -395,6 +414,8 @@ extern "C" [[noreturn]] void kmain(u64 bootMagic, u64 bootInfo) {
     testHeap();
     Arch::Acpi::init(info);
     Arch::Acpi::report(info.diagnostic);
+    Arch::Cpu::calibrateTsc(); // (may use the FADT's PM timer)
+    Arch::Cpu::initPowerStates();
     Arch::Iommu::init(info); // before any driver can turn on a device's DMA
 
     if constexpr (RUDRACORE_PANIC_TEST) {

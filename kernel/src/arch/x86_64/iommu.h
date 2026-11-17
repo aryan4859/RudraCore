@@ -9,10 +9,11 @@
 // buffer, and only that buffer, mapped for its device. Without VT-d
 // hardware (no ACPI DMAR table) DMA stays unconfined, and the log says so.
 //
-// Interrupt remapping, where every unit supports it: devices may not send
-// interrupt messages (MSI) at all, since every interrupt here comes through
-// the legacy PIC. That stops a device from raising arbitrary vectors, NMIs
-// or SMIs by writing to 0xFEExxxxx.
+// Interrupt remapping, where every unit supports it: a device may send an
+// interrupt message (MSI) only through an entry made for it (remapMsi),
+// checked against its requester id, and only for that entry's vector. That
+// stops a device from raising arbitrary vectors, NMIs or SMIs by writing
+// to 0xFEExxxxx.
 namespace Rudracore::Arch::Iommu {
 
 // Finds the remapping units and turns translation on, all devices blocked.
@@ -28,6 +29,12 @@ bool remapsInterrupts();
 // False if remapping is off, or there's no queued invalidation or no I/O
 // APIC device scope to check against.
 bool remapIoapicPin(u32 index, u8 vector, bool level, u8 destination);
+
+// Lets `device` (and only it: requester id checked) raise edge-triggered
+// `vector` on `destination` through entry `index`. Same conditions.
+bool remapMsi(u32 index, Pci::Address device, u8 vector, u8 destination);
+// Makes entry `index` not present again.
+void removeEntry(u32 index);
 
 // Lets the device at `device` read and write [physical, physical + size)
 // at the same addresses. False if out of memory.

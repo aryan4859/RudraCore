@@ -24,6 +24,12 @@ inline u16 inw(u16 port) {
     return value;
 }
 
+inline u32 inl(u16 port) {
+    u32 value;
+    asm volatile("inl %1, %0" : "=a"(value) : "Nd"(port));
+    return value;
+}
+
 [[noreturn]] inline void halt() {
     for (;;)
         asm volatile("cli; hlt");

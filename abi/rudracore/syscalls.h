@@ -122,6 +122,11 @@ enum Syscall : unsigned long {
                                   //     (a PCI device's interrupt, as _PRT routes it in APIC mode);
                                   //   INTERRUPTS_APIC: switch from the 8259 PICs to the APICs.
                                   //   IO_ERROR if that couldn't be done (still on the PICs).
+    SYS_DEVICE_MSI = 44, // (Handle device) -> Handle irq: the device's message-signalled interrupt
+                         //   (MSI, else MSI-X entry 0), programmed by the kernel; its INTx pin goes
+                         //   off. Used like any IRQ (wait, bind, ack). Needs RIGHT_MMIO. NOT_FOUND
+                         //   without MSI/MSI-X or before the APICs are on (use the pin then);
+                         //   ALREADY_EXISTS if the device has one; NO_SPACE when all are taken.
 };
 
 constexpr unsigned long INTERRUPTS_ROUTE = 1, INTERRUPTS_APIC = 2;

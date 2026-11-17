@@ -60,4 +60,88 @@ inline u64 currentFramePointer() {
     return reinterpret_cast<u64>(__builtin_frame_address(0));
 }
 
+inline void cpuid(u32 leaf, u32 sub, u32& a, u32& b, u32& c, u32& d) {
+    asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(leaf), "c"(sub));
+}
+
+inline u64 readTsc() {
+    u32 lo, hi;
+    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return u64{hi} << 32 | lo;
+}
+
+// Model-specific registers. readMsr/writeMsr fault (#GP) on an MSR the CPU
+// doesn't have: use them only where CPUID promises the register, and
+// Cpu::readMsrSafe otherwise.
+namespace Msr {
+constexpr u32 APIC_BASE = 0x1B;
+constexpr u32 PLATFORM_INFO = 0xCE;       // Intel: base (non-turbo) ratio in bits 8-15
+constexpr u32 MCG_CAP = 0x179, MCG_STATUS = 0x17A;
+constexpr u32 PERF_STATUS = 0x198;
+constexpr u32 MC0_CTL = 0x400;            // bank i: CTL, STATUS, ADDR, MISC at 0x400 + 4i
+constexpr u32 PM_ENABLE = 0x770, HWP_CAPABILITIES = 0x771, HWP_REQUEST = 0x774;
+constexpr u32 EFER = 0xC0000080;
+} // namespace Msr
+
+inline u64 readMsr(u32 msr) {
+    u32 lo, hi;
+    asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return u64{hi} << 32 | lo;
+}
+
+inline void writeMsr(u32 msr, u64 value) {
+    asm volatile("wrmsr" : : "c"(msr), "a"(static_cast<u32>(value)), "d"(static_cast<u32>(value >> 32)) : "memory");
+}
+
+struct Frame;
+
+// The processor: what it can do (CPUID), checked against what RudraCore
+// needs, its TSC rate, machine checks, and its power states.
+namespace Cpu {
+
+struct Features {
+    char vendor[13];
+    char brand[49];
+    u32 family, model, stepping;
+    bool intel, amd, hypervisor;
+    // Required (validate() panics without them).
+    bool fpu, tsc, msr, pae, cx8, cmov, fxsr, sse, sse2, nx, longMode;
+    // Optional.
+    bool apic, x2apic, pge, mce, mca, sse3, ssse3, sse41, sse42, avx, xsave, rdrand, rdseed;
+    bool smep, smap, monitor, mwaitBreak, invariantTsc, tscDeadline, hwp, hwpEpp, pdpe1gb;
+    u32 mwaitSubStates;   // CPUID 5 EDX: sub-states per MWAIT C-state, 4 bits each
+    u64 tscHz;            // 0 until calibrateTsc() (or if it couldn't)
+    char const* tscSource;
+};
+
+// Reads CPUID and panics, naming them, if a required feature is missing.
+// First thing after the console is up.
+void init();
+Features const& features();
+
+// rdmsr that returns false instead of faulting on an MSR this CPU lacks.
+bool readMsrSafe(u32 msr, u64& value);
+bool writeMsrSafe(u32 msr, u64 value);
+// For the #GP handler: true (and the frame fixed up) if the fault was readMsrSafe's.
+bool recoverMsrFault(Frame& frame);
+
+// Measures the TSC: CPUID 0x15, the hypervisor's timing leaf, the ACPI PM
+// timer, else the PIT. After Acpi::init.
+void calibrateTsc();
+
+// Machine checks on (CR4.MCE), and what the banks held from before this
+// boot logged and cleared.
+void enableMachineChecks();
+// Logs every bank with a valid error (for the #MC panic).
+void reportMachineCheck();
+
+// P-states (Intel HWP: the CPU picks its own frequency) and the C-state the
+// idle loop sleeps in. Logs both.
+void initPowerStates();
+// Sleeps until the next interrupt, in the deepest chosen C-state, then
+// returns with interrupts enabled.
+void idle();
+
+} // namespace Cpu
+
 } // namespace Rudracore::Arch

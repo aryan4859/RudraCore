@@ -33,6 +33,9 @@ bool enable();
 
 bool active();
 
+// This CPU's local APIC id (where interrupt messages go). While active.
+u8 localId();
+
 // While active: the PIC functions (Pic::mask, unmask, endOfInterrupt) come here.
 void mask(u8 line);
 void unmask(u8 line);

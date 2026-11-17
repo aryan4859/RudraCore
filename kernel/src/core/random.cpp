@@ -17,11 +17,7 @@ u64 lastHardware = 0;
 u32 hardwareRepeats = 0;
 Health status{};
 
-u64 rdtsc() {
-    u32 lo, hi;
-    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return (u64{hi} << 32) | lo;
-}
+u64 rdtsc() { return Arch::readTsc(); }
 
 // Continuous test (SP 800-90B 4.4.1 style): a value equal to the last one is
 // a failure, and after three the source is no longer used. (A healthy
@@ -151,9 +147,7 @@ void init(u64 seed) {
     kat = knownAnswer();
     status.knownAnswer = kat;
 
-    u32 a, b, c, d;
-    asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
-    hardware = c & (1u << 30); // RDRAND
+    hardware = Arch::Cpu::features().rdrand;
     status.hardwarePresent = hardware;
     if (hardware) {
         // Start-up test: 16 outputs, all different, none all-zero or all-one.
