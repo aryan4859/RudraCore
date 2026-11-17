@@ -120,11 +120,17 @@ void logRegisters(Frame const& f) {
     Panic::end();
 }
 
-// A user program faulted: report it and end that task. The kernel and the
-// other tasks keep running.
+// A user program faulted: report it (and keep what happened for whoever
+// holds a handle to it), then its process ends. The kernel and the other
+// programs keep running.
 void logUserFault(Frame const& f) {
     auto* task = Sched::current();
-    log("[sched] ", task->name, " (task ", task->id, ") crashed: ", exceptionName(f.vector),
+    if (Core::Process* p = task->process) {
+        p->faultVector = f.vector;
+        p->faultRip = f.rip;
+        p->faultAddress = f.vector == VECTOR_PAGE_FAULT ? readCr2() : 0;
+    }
+    log("[sched] ", task->name, " (thread ", task->id, ") crashed: ", exceptionName(f.vector),
         " at ", Hex{f.rip});
     if (f.vector == VECTOR_PAGE_FAULT) {
         log("[sched]   ", (f.error & 1) ? "protection violation" : "page not mapped", " on ",
@@ -191,10 +197,10 @@ extern "C" Frame* interruptDispatch(Frame* frame) {
         case Vm::Fault::Pending: return Sched::blockCurrent(frame); // the instruction runs again when the page is in
         case Vm::Fault::Retry: return Sched::sleepCurrent(frame, 1);
         case Vm::Fault::OutOfMemory:
-            if (Core::Task* victim = Vm::outOfMemory(task); victim and victim != task)
+            if (Core::Process* victim = Vm::outOfMemory(task->process); victim and victim != task->process)
                 return frame; // memory is free again: run the instruction again
-            log("[vm]   ", task->name, " (task ", task->id, ") ran out of memory");
-            return Sched::exitCurrent(frame, -1);
+            log("[vm]   ", task->name, " (thread ", task->id, ") ran out of memory");
+            return Sched::exitProcess(frame, Abi::EXIT_OUT_OF_MEMORY);
         case Vm::Fault::Invalid: break; // a real fault
         }
     }
@@ -202,7 +208,7 @@ extern "C" Frame* interruptDispatch(Frame* frame) {
     if (vector < 32) {
         if (fromUser and vector != Idt::VECTOR_MACHINE_CHECK) { // (#MC is the machine's, not the task's)
             Idt::logUserFault(*frame);
-            return Sched::exitCurrent(frame, -1);
+            return Sched::exitProcess(frame, Abi::EXIT_FAULT);
         }
         Idt::exceptionPanic(*frame);
     }

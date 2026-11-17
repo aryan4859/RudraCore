@@ -1,9 +1,12 @@
 #include <kapala/heap.h>
 #include <kapala/sys.h>
+#include <kapala/thread.h>
 
 namespace Kapala::Heap {
 
 namespace {
+
+Mutex lock; // threads share the heap
 
 constexpr unsigned MAGIC_USED = 0x4B41504C; // "KAPL"
 constexpr unsigned MAGIC_FREE = 0x46524545; // "FREE"
@@ -85,6 +88,7 @@ void* allocBig(unsigned long size) {
 } // namespace
 
 void* alloc(unsigned long size) {
+    MutexGuard held(lock);
     unsigned long needed = size + sizeof(Header);
     for (unsigned c = 0; c < CLASSES; c++) {
         if (SIZES[c] < needed)
@@ -105,6 +109,7 @@ void free(void* pointer) {
     if (not pointer)
         return;
 
+    MutexGuard held(lock);
     auto* header = reinterpret_cast<Header*>(static_cast<unsigned char*>(pointer) - sizeof(Header));
     if (header->magic != MAGIC_USED) {
         Sys::log(header->magic == MAGIC_FREE ? "heap: double free" : "heap: freeing a bad pointer");
@@ -124,6 +129,7 @@ void free(void* pointer) {
 }
 
 Stats stats() {
+    MutexGuard held(lock);
     return {bytesInUse, bytesFromKernel};
 }
 

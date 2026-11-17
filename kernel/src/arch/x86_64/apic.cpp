@@ -14,6 +14,12 @@ constexpr u32 MAX_ROUTES = 32, MAX_INPUTS = 120;
 
 // Local APIC registers
 constexpr u64 LAPIC_ID = 0x20, LAPIC_TPR = 0x80, LAPIC_EOI = 0xB0, LAPIC_SVR = 0xF0;
+constexpr u64 LAPIC_ICR_LOW = 0x300, LAPIC_ICR_HIGH = 0x310;
+constexpr u64 LAPIC_LVT_TIMER = 0x320, LAPIC_LVT_LINT0 = 0x350, LAPIC_LVT_LINT1 = 0x360;
+constexpr u64 LAPIC_TIMER_INITIAL = 0x380, LAPIC_TIMER_CURRENT = 0x390, LAPIC_TIMER_DIVIDE = 0x3E0;
+constexpr u32 LVT_MASKED = 1u << 16, LVT_EXTINT = 0x700, LVT_NMI = 0x400, LVT_PERIODIC = 1u << 17;
+constexpr u32 ICR_PENDING = 1u << 12, ICR_INIT = 0x500, ICR_STARTUP = 0x600, ICR_ASSERT = 1u << 14,
+              ICR_LEVEL = 1u << 15;
 // I/O APIC: select register, then the window
 constexpr u64 IOREGSEL = 0x00, IOWIN = 0x10;
 constexpr u32 IOAPIC_VERSION = 0x01, REDIRECTION = 0x10;
@@ -55,22 +61,25 @@ void writeEntry(u32 input, u32 low, u32 high) {
 }
 
 // One I/O APIC input feeding `line`. With remapping, the entry is in the
-// remappable format, its index the input number.
+// remappable format, its index the input number. Interrupt distribution:
+// the timer (line 0) goes to the boot CPU, which keeps the time; every other
+// line goes to the next CPU in turn.
 bool route(u32 gsi, u8 line, bool level, bool activeLow) {
     if (gsi < gsiBase or gsi - gsiBase >= inputs)
         return false;
     u32 input = gsi - gsiBase;
     u8 vector = static_cast<u8>(Pic::IRQ_BASE + line);
+    u8 destination = line == 0 ? apicId : nextDestination();
     u32 low = vector | (level ? RTE_LEVEL : 0) | (activeLow ? RTE_ACTIVE_LOW : 0);
     u32 high;
     if (remapped) {
-        if (not Iommu::remapIoapicPin(input, vector, level, apicId))
+        if (not Iommu::remapIoapicPin(input, vector, level, destination))
             return false;
         // Remappable format: bit 48 set, the entry's index in bits 49-63 (and bit 11).
         low |= (input >> 15 & 1) << 11;
         high = 1u << 16 | (input & 0x7FFF) << 17;
     } else {
-        high = static_cast<u32>(apicId) << 24; // physical destination: this CPU
+        high = static_cast<u32>(destination) << 24; // physical destination
     }
     table[input] = {true, line, low, high};
     writeEntry(input, low | RTE_MASKED, high);
@@ -109,10 +118,9 @@ bool enable() {
 
     // The local APIC: on (IA32_APIC_BASE bit 11, then the spurious vector
     // register), all priorities accepted.
-    writeMsr(Msr::APIC_BASE, readMsr(Msr::APIC_BASE) | (1u << 11));
-    lapic = static_cast<u32 volatile*>(Acpi::map(m.localApic, 4096, Vmm::Cache::Uncached));
+    if (not initLocal(true))
+        return false;
     ioapic = static_cast<u32 volatile*>(Acpi::map(m.ioApic, 4096, Vmm::Cache::Uncached));
-    apicId = static_cast<u8>(lapicRead(LAPIC_ID) >> 24);
     gsiBase = m.ioApicGsiBase;
     inputs = ((ioRead(IOAPIC_VERSION) >> 16) & 0xFF) + 1;
     if (inputs > MAX_INPUTS)
@@ -163,7 +171,84 @@ bool enable() {
 
 bool active() { return on; }
 
-u8 localId() { return apicId; }
+u8 localId() { return lapic ? static_cast<u8>(lapicRead(LAPIC_ID) >> 24) : apicId; }
+
+bool initLocal(bool boot) {
+    auto const& m = Acpi::info().madt;
+    if (not m.present or not m.localApic)
+        return false;
+    writeMsr(Msr::APIC_BASE, readMsr(Msr::APIC_BASE) | (1u << 11));
+    if (not lapic)
+        lapic = static_cast<u32 volatile*>(Acpi::map(m.localApic, 4096, Vmm::Cache::Uncached));
+    if (boot)
+        apicId = static_cast<u8>(lapicRead(LAPIC_ID) >> 24);
+    // Software-enabled, every priority accepted. On the boot CPU, LINT0 stays
+    // the 8259s' way in (ExtINT) until the I/O APIC takes over; the other
+    // CPUs take no ExtINT. LINT1 is NMI everywhere.
+    lapicWrite(LAPIC_TPR, 0);
+    lapicWrite(LAPIC_LVT_LINT0, boot ? LVT_EXTINT : LVT_MASKED);
+    lapicWrite(LAPIC_LVT_LINT1, LVT_NMI);
+    lapicWrite(LAPIC_SVR, 0x100 | SPURIOUS_VECTOR);
+    return true;
+}
+
+void sendIpi(u8 destination, u8 vector) {
+    while (lapicRead(LAPIC_ICR_LOW) & ICR_PENDING)
+        asm volatile("pause");
+    lapicWrite(LAPIC_ICR_HIGH, u32{destination} << 24);
+    lapicWrite(LAPIC_ICR_LOW, vector); // fixed delivery, physical, edge
+}
+
+void sendInit(u8 destination) {
+    lapicWrite(LAPIC_ICR_HIGH, u32{destination} << 24);
+    lapicWrite(LAPIC_ICR_LOW, ICR_INIT | ICR_ASSERT | ICR_LEVEL);
+    while (lapicRead(LAPIC_ICR_LOW) & ICR_PENDING)
+        asm volatile("pause");
+}
+
+void sendStartup(u8 destination, u8 page) {
+    lapicWrite(LAPIC_ICR_HIGH, u32{destination} << 24);
+    lapicWrite(LAPIC_ICR_LOW, ICR_STARTUP | page);
+    while (lapicRead(LAPIC_ICR_LOW) & ICR_PENDING)
+        asm volatile("pause");
+}
+
+void localEndOfInterrupt() { lapicWrite(LAPIC_EOI, 0); }
+
+u32 measureTimer(u64 tscHz) {
+    // Counting down from the top for 10 ms of TSC.
+    lapicWrite(LAPIC_TIMER_DIVIDE, 0x3); // divide by 16
+    lapicWrite(LAPIC_LVT_TIMER, LVT_MASKED);
+    lapicWrite(LAPIC_TIMER_INITIAL, 0xFFFFFFFF);
+    u64 start = readTsc(), wait = tscHz / 100;
+    while (readTsc() - start < wait)
+        asm volatile("pause");
+    u32 elapsed = 0xFFFFFFFF - lapicRead(LAPIC_TIMER_CURRENT);
+    lapicWrite(LAPIC_TIMER_INITIAL, 0);
+    return elapsed / 10; // per millisecond
+}
+
+void startTimer(u32 ticksPerMs, u8 vector) {
+    lapicWrite(LAPIC_TIMER_DIVIDE, 0x3);
+    lapicWrite(LAPIC_LVT_TIMER, LVT_PERIODIC | vector);
+    lapicWrite(LAPIC_TIMER_INITIAL, ticksPerMs);
+}
+
+namespace {
+u8 destinations[Acpi::Madt::MAX_CPUS];
+u32 destinationCount = 0, nextOne = 0;
+} // namespace
+
+void addDestination(u8 id) {
+    if (destinationCount < Acpi::Madt::MAX_CPUS)
+        destinations[destinationCount++] = id;
+}
+
+u8 nextDestination() {
+    if (not destinationCount)
+        return apicId;
+    return destinations[nextOne++ % destinationCount];
+}
 
 void mask(u8 line) {
     for (u32 i = 0; i < inputs; i++) {

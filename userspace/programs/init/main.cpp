@@ -237,6 +237,7 @@ int main() {
         Sys::spawn("harden-test");
         Sys::spawn("fpu-test"); // two at once: their floating-point
         Sys::spawn("fpu-test"); // registers must not mix
+        Sys::spawn("thread-test");
         checkIpc();
     }
 

@@ -1,5 +1,7 @@
 #include "arch/x86_64/gdt.h"
 
+#include "arch/x86_64/cpu.h"
+
 namespace Rudracore::Arch::Gdt {
 
 namespace {
@@ -26,10 +28,14 @@ constexpr u64 KERNEL_DATA_DESC = 0x00cf92000000ffff;
 constexpr u64 USER_DATA_DESC = 0x00cff2000000ffff;
 constexpr u64 USER_CODE_DESC = 0x00affa000000ffff;
 
-alignas(16) u64 entries[7];
-alignas(16) Tss tss;
-alignas(16) u8 doubleFaultStack[16 * 1024];
-alignas(16) u8 interruptStack[16 * 1024];
+constexpr usize STACK = 16 * 1024;
+
+// One GDT for every CPU, with a TSS descriptor per CPU (each CPU loads its
+// own: that's also how a CPU knows which one it is, Smp::index).
+alignas(16) u64 entries[TSS / 8 + 2 * MAX_CPUS];
+alignas(16) Tss tss[MAX_CPUS];
+alignas(16) u8 doubleFaultStacks[MAX_CPUS][STACK];
+alignas(16) u8 interruptStacks[MAX_CPUS][STACK];
 
 // A TSS descriptor takes two GDT slots in long mode.
 void setTssDescriptor(usize slot, u64 base, u32 limit) {
@@ -49,13 +55,17 @@ void init() {
     entries[KERNEL_DATA / 8] = KERNEL_DATA_DESC;
     entries[USER_DATA / 8] = USER_DATA_DESC;
     entries[USER_CODE / 8] = USER_CODE_DESC;
+    for (u32 cpu = 0; cpu < MAX_CPUS; cpu++) {
+        tss[cpu] = {};
+        tss[cpu].rsp[0] = reinterpret_cast<u64>(interruptStacks[cpu] + STACK);
+        tss[cpu].ist[IST_DOUBLE_FAULT - 1] = reinterpret_cast<u64>(doubleFaultStacks[cpu] + STACK);
+        tss[cpu].ioMapBase = sizeof(Tss); // no I/O permission bitmap
+        setTssDescriptor(TSS / 8 + 2 * cpu, reinterpret_cast<u64>(&tss[cpu]), sizeof(Tss) - 1);
+    }
+    load(0);
+}
 
-    tss = {};
-    tss.rsp[0] = reinterpret_cast<u64>(interruptStack + sizeof(interruptStack));
-    tss.ist[IST_DOUBLE_FAULT - 1] = reinterpret_cast<u64>(doubleFaultStack + sizeof(doubleFaultStack));
-    tss.ioMapBase = sizeof(Tss); // no I/O permission bitmap
-    setTssDescriptor(TSS / 8, reinterpret_cast<u64>(&tss), sizeof(Tss) - 1);
-
+void load(u32 cpu) {
     Pointer pointer{sizeof(entries) - 1, reinterpret_cast<u64>(entries)};
 
     // Load the GDT, reload CS with a far return, then the data segments.
@@ -75,11 +85,11 @@ void init() {
         : "m"(pointer), "i"(KERNEL_CODE), "r"(u64(KERNEL_DATA))
         : "rax", "memory");
 
-    asm volatile("ltr %w0" : : "r"(u64(TSS)));
+    asm volatile("ltr %w0" : : "r"(u64(TSS + 16 * cpu)));
 }
 
 void setKernelStack(u64 top) {
-    tss.rsp[0] = top;
+    tss[Smp::index()].rsp[0] = top;
 }
 
 } // namespace Rudracore::Arch::Gdt

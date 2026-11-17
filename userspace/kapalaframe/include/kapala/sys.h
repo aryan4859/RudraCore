@@ -58,7 +58,42 @@ inline long spawn(char const* name, Handle const* handles = nullptr, unsigned lo
 
 inline long systemInfo(SystemInfo& out) { return syscall(SYS_SYSTEM_INFO, arg(&out)); }
 
-// Every task (up to `capacity` written): returns how many there are.
+// MARK: Threads and processes (most code uses Kapala::Thread instead)
+
+inline long threadCreate(void (*entry)(void*), void* stackTop, void* argument, void* tls) {
+    return syscall(SYS_THREAD_CREATE, reinterpret_cast<unsigned long>(entry), arg(stackTop), arg(argument), arg(tls));
+}
+[[noreturn]] inline void threadExit(long code) {
+    syscall(SYS_THREAD_EXIT, static_cast<unsigned long>(code));
+    __builtin_unreachable();
+}
+inline unsigned long threadId() { return static_cast<unsigned long>(syscall(SYS_THREAD_ID)); }
+inline long threadJoin(unsigned long thread, long* code = nullptr, unsigned long timeoutMs = WAIT_FOREVER) {
+    return syscall(SYS_THREAD_JOIN, thread, arg(code), timeoutMs);
+}
+inline long threadSetTls(void* base) { return syscall(SYS_THREAD_SET_TLS, arg(base)); }
+inline long futexWait(unsigned* word, unsigned expected, unsigned long timeoutMs = WAIT_FOREVER) {
+    return syscall(SYS_FUTEX_WAIT, arg(word), expected, timeoutMs);
+}
+inline long futexWake(unsigned* word, unsigned long count) { return syscall(SYS_FUTEX_WAKE, arg(word), count); }
+
+// Like spawn, with SPAWN_* flags (SPAWN_HANDLE: a process handle comes back).
+inline long spawnWith(char const* name, Handle const* handles, unsigned long count, unsigned long flags) {
+    return syscall(SYS_SPAWN, arg(name), length(name), arg(handles), count, flags);
+}
+inline long processWait(Handle process, long* code = nullptr, unsigned long timeoutMs = WAIT_FOREVER) {
+    return syscall(SYS_PROCESS_WAIT, process, arg(code), timeoutMs);
+}
+inline long processSignal(Handle process, unsigned long signal, unsigned long flags = 0) {
+    return syscall(SYS_PROCESS_SIGNAL, process, signal, flags);
+}
+inline long processLimit(Handle process, unsigned long limit, unsigned long value) {
+    return syscall(SYS_PROCESS_LIMIT, process, limit, value);
+}
+inline long processEvents(Handle endpoint) { return syscall(SYS_PROCESS_EVENTS, endpoint); }
+inline long processInfo(Handle process, ProcessInfo& out) { return syscall(SYS_PROCESS_INFO, process, arg(&out)); }
+
+// Every process (up to `capacity` written): returns how many there are.
 inline long taskList(TaskInfo* out, unsigned long capacity) { return syscall(SYS_TASK_LIST, arg(out), capacity); }
 
 inline long kernelStats(KernelStats& out) { return syscall(SYS_KERNEL_STATS, arg(&out)); }

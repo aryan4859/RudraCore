@@ -82,6 +82,7 @@ constexpr u32 CLOCK_MODULATION = 0x19A;
 constexpr u32 MC0_CTL = 0x400;            // bank i: CTL, STATUS, ADDR, MISC at 0x400 + 4i
 constexpr u32 PM_ENABLE = 0x770, HWP_CAPABILITIES = 0x771, HWP_REQUEST = 0x774;
 constexpr u32 EFER = 0xC0000080;
+constexpr u32 FS_BASE = 0xC0000100; // user threads' thread-local storage
 } // namespace Msr
 
 inline u64 readMsr(u32 msr) {

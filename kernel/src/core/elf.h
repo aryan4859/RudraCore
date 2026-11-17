@@ -3,7 +3,7 @@
 #include "mem/vmm.h"
 
 namespace Rudracore::Core {
-struct Task;
+struct Process;
 struct SharedMemory;
 } // namespace Rudracore::Core
 
@@ -39,6 +39,6 @@ bool load(Core::SharedMemory* image, usize size, Program& out, char const*& erro
 // the image (code and constants shared by every program started from it,
 // data copied when first written, .bss zero-filled on first touch), and its
 // stack (on first touch, too). False (and `error`) if memory runs short.
-bool mapRegions(Core::Task& task, Core::SharedMemory* image, usize size, Program const& program, char const*& error);
+bool mapRegions(Core::Process& task, Core::SharedMemory* image, usize size, Program const& program, char const*& error);
 
 } // namespace Rudracore::Elf

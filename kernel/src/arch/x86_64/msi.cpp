@@ -41,13 +41,14 @@ u64 barAddress(Pci::Address d, u8 index) {
 // remapping (remappable format: bit 4, the handle in bits 5-19 and 2),
 // else straight to this CPU's local APIC, fixed delivery, edge.
 bool message(Pci::Address d, u8 vector, u32 index, u32& address, u32& data) {
+    u8 destination = Apic::nextDestination(); // (interrupts spread over the CPUs)
     if (Iommu::remapsInterrupts()) {
-        if (not Iommu::remapMsi(index, d, vector, Apic::localId()))
+        if (not Iommu::remapMsi(index, d, vector, destination))
             return false;
         address = 0xFEE00000 | (index & 0x7FFF) << 5 | 1 << 4 | ((index >> 15) & 1) << 2;
         data = 0;
     } else {
-        address = 0xFEE00000 | u32{Apic::localId()} << 12;
+        address = 0xFEE00000 | u32{destination} << 12;
         data = vector;
     }
     return true;

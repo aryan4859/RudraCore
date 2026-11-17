@@ -12,6 +12,7 @@ enum class ObjectType : u8 {
     IoPorts,
     PciDevice,
     Firmware, // ACPI: non-RAM physical memory and PCI configuration (the acpi server)
+    Process,  // a running (or ended) program: wait for it, signal it, limit it
 };
 
 // Base of everything a handle can refer to. Reference counted: each handle,

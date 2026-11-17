@@ -8,6 +8,8 @@
 
 namespace Rudracore::Core {
 
+struct SharedMemory;
+
 enum class TaskState : u8 {
     Ready,
     Running,
@@ -16,21 +18,12 @@ enum class TaskState : u8 {
     Dead,
 };
 
-// Who a task is, which bounds what it may hold and do:
-//   Root    init (started by the kernel)
-//   System  what init starts: drivers, servers, KamalShell, boot checks
-//   App     what anything else starts: built-in and installed apps
-// Only Root and System tasks may start programs, and an App never holds
-// hardware (devices, IRQs, I/O ports, device memory).
-enum class Privilege : u8 {
-    App,
-    System,
-    Root,
-};
+struct Process;
 
+// A thread: what the scheduler runs. User threads belong to a process (which
+// holds the address space, handles and memory); kernel tasks belong to none.
+// The first thread's id is also its process's id.
 struct Task {
-    static constexpr usize MAX_HANDLES = 64;
-
     u64 id = 0;
     char name[32] = {};
     TaskState state = TaskState::Ready;
@@ -43,49 +36,38 @@ struct Task {
     u64 stackPhysical = 0; // kernel stack pages (0 for the boot task's static stack)
     u64 stackTop = 0;      // also where the CPU enters the kernel from user mode
 
-    Vmm::Space* space = nullptr; // nullptr for kernel tasks
-    Quota* quota = nullptr;      // user tasks: the memory it may hold (holds a reference)
-    Privilege privilege = Privilege::App;
+    Process* process = nullptr; // nullptr for kernel tasks (holds a reference)
+    u64 fsBase = 0;             // thread-local storage: the FS segment base (IA32_FS_BASE)
     u64 cpuMs = 0; // CPU time used so far (in 1 ms timer ticks)
     u64 wakeAt = 0;
-    u64 waitDeadline = 0; // while in a timed SYS_WAIT: when it gives up (0 = none)
+    u64 waitDeadline = 0; // while in a timed wait: when it gives up (0 = none)
     i64 exitCode = 0;
 
-    Task* next = nullptr;    // link in the ready, sleep or zombie list
-    Task* allNext = nullptr; // link in the list of every task (Sched::allTasks)
+    Task* next = nullptr;       // link in the ready, sleep or zombie list
+    Task* allNext = nullptr;    // link in the list of every task (Sched::allTasks)
+    Task* threadNext = nullptr; // link in its process's threads
+
+    // What a blocked thread waits for, besides channels and IRQs (which point
+    // at it themselves). Each list forgets the thread when it ends.
+    SharedMemory* pageWaitObject = nullptr; // a pager's page (Vm)
+    u64 pageWaitIndex = 0;
+    Task* pageWaitNext = nullptr;
+    u64 futexKey = 0;                       // a futex (physical address of the word)
+    Task* futexNext = nullptr;
+    bool futexWoken = false;                // woken by futex_wake (not a timeout)
+    u64 joinTarget = 0;                     // a thread of its process (join)
+    Process* exitWaitTarget = nullptr;      // another process (process_wait)
 
     // Floating point / SSE registers while the task isn't running (FXSAVE
     // format, must be 16-byte aligned).
     alignas(16) u8 fpuState[512];
 
-    // A handle's value is (generation << 8) | slot; the generation counts
-    // how often the slot was freed, so a stale value never matches.
-    struct HandleSlot {
-        Capability cap;
-        u64 generation = 0;
-    };
-    HandleSlot handles[MAX_HANDLES] = {}; // slot 0 is never used
-    Vm::Map vm; // its address space's regions (user tasks)
-
-    bool isUser() const { return space != nullptr; }
-
-    // Takes over the capability's reference. Returns the handle, or 0 if the
-    // table is full.
-    u64 addHandle(Capability cap);
-
-    // The capability behind a handle (no reference added; revoked ones
-    // included), or nullptr if the handle isn't open.
-    Capability* handle(u64 h);
-
-    // Removes the handle and returns its capability (and reference) to the
-    // caller; an empty one if the handle isn't open.
-    Capability takeHandle(u64 h);
-
-    // Drops every handle and mapping, and the address space.
-    void releaseResources();
+    bool isUser() const { return process != nullptr; }
 };
 
 } // namespace Rudracore::Core
+
+#include "core/process.h"
 
 // Preemptive round-robin scheduler with a 10 ms time slice.
 //
@@ -105,18 +87,30 @@ Core::Task* spawnKernel(char const* name, void (*entry)(u64), u64 arg);
 Core::Task* spawnUser(char const* name, Vmm::Space* space, u64 entry, u64 stackTop,
                       Core::Capability const* handles = nullptr, usize handleCount = 0);
 
-// The same in two steps: the task exists (so regions can be added to its
-// address space) but doesn't run until startTask, or is thrown away with
-// discard (which also drops its handles and space).
+// The same in two steps: the process and its first thread exist (so
+// regions can be added to its address space) but don't run until
+// startTask, or are thrown away with discard (which also drops its handles
+// and space). Its group is `parent`'s, or a new one.
 Core::Task* createUser(char const* name, Vmm::Space* space, u64 entry, u64 stackTop,
-                       Core::Capability const* handles = nullptr, usize handleCount = 0);
+                       Core::Capability const* handles = nullptr, usize handleCount = 0,
+                       Core::Process* parent = nullptr, bool newGroup = false);
 void startTask(Core::Task* task);
 void discard(Core::Task* task);
 
-// Ends a task that isn't the one running (out of memory, or asked to):
-// off every queue, its resources freed now. False for the current task (it
-// ends itself through exitCurrent) and the idle task.
-bool kill(Core::Task* task, i64 code);
+// Another thread of `process`, running at `entry` with `arg` (in rdi),
+// `stackTop` and its TLS base. nullptr at the thread limit or out of memory.
+Core::Task* createThread(Core::Process* process, u64 entry, u64 stackTop, u64 arg, u64 fsBase);
+
+// A thread's thread-local storage base (FS), loaded now if it's running.
+void setThreadBase(Core::Task* task, u64 base);
+
+// The current thread ends (its process too, if it was the last).
+Arch::Frame* exitThread(Arch::Frame* frame, i64 code);
+// The current process ends: every thread, with `code`.
+Arch::Frame* exitProcess(Arch::Frame* frame, i64 code);
+// Another process ends at once (killed, out of memory): every thread off
+// every queue, its resources freed.
+void endProcess(Core::Process* process, i64 code);
 
 // Every task that exists (linked by Task::allNext), dead ones not yet freed included.
 Core::Task* allTasks();
@@ -142,7 +136,6 @@ void wake(Core::Task* task);
 Arch::Frame* onTimerTick(Arch::Frame* frame);
 Arch::Frame* switchFrom(Arch::Frame* frame);
 Arch::Frame* sleepCurrent(Arch::Frame* frame, u64 milliseconds);
-Arch::Frame* exitCurrent(Arch::Frame* frame, i64 code);
 
 // Blocks the current task until something calls wake() on it. The caller
 // must have registered the task with the object it waits on first.

@@ -4,6 +4,7 @@
 
 namespace Rudracore::Core {
 struct Task;
+struct Process;
 struct SharedMemory;
 } // namespace Rudracore::Core
 
@@ -45,10 +46,6 @@ struct Region {
 struct Map {
     Region* regions = nullptr; // sorted by address, never overlapping
     u32 count = 0, capacity = 0;
-    // A fault waiting for a pager (the object and page), linked with others.
-    Core::SharedMemory* waitObject = nullptr;
-    u64 waitIndex = 0;
-    Core::Task* waitNext = nullptr;
 };
 
 constexpr u64 MAP_BASE = 0x100000000;          // mappings go from 4 GiB...
@@ -65,26 +62,29 @@ enum class Fault : u8 {
 
 // Each returns an Abi::Error (OK); `address` gets where the region went.
 // `at` is a fixed address (0: the first free gap from MAP_BASE).
-i64 mapAnonymous(Core::Task& task, u64 size, bool writable, u64 at, u64& address);
-i64 mapObject(Core::Task& task, Core::SharedMemory* object, Kind kind, u64 offset, u64 size, u64 visible,
+i64 mapAnonymous(Core::Process& process, u64 size, bool writable, u64 at, u64& address);
+i64 mapObject(Core::Process& process, Core::SharedMemory* object, Kind kind, u64 offset, u64 size, u64 visible,
               bool writable, bool executable, u64 at, u64& address);
 // Removes the region starting at `address`, freeing its private pages.
-i64 unmap(Core::Task& task, u64 address);
+i64 unmap(Core::Process& process, u64 address);
 // Makes the region at `address` read-only (or writable again, if it was made so).
-i64 protect(Core::Task& task, u64 address, bool writable);
+i64 protect(Core::Process& process, u64 address, bool writable);
 
-// A user page fault at `address`.
-Fault fault(Core::Task& task, u64 address, bool write, bool execute);
+// A user page fault at `address` in `thread` (which waits, if it's Pending).
+Fault fault(Core::Task& thread, u64 address, bool write, bool execute);
 
 // Makes [address, address + length) present (and writable, if asked) before
 // the kernel touches it in a system call.
-Fault prepare(Core::Task& task, u64 address, u64 length, bool write);
+Fault prepare(Core::Task& thread, u64 address, u64 length, bool write);
 
-// Drops every region (the task is ending; its space is about to go).
-void release(Core::Task& task);
+// Drops every region (the process is ending; its space is gone already).
+void release(Core::Process& process);
+
+// A thread ends: it no longer waits for a page.
+void forgetWait(Core::Task& thread);
 
 // handle_revoke: every other program's regions of `object` go.
-void revoke(Core::SharedMemory* object, Core::Task* except);
+void revoke(Core::SharedMemory* object, Core::Process* except);
 // memory_seal: writable shared mappings of `object` become read-only.
 void seal(Core::SharedMemory* object);
 
@@ -104,11 +104,12 @@ struct Usage {
     u64 shared;    // pages of objects it maps
     u32 regions;
 };
-Usage usage(Core::Task const& task);
+Usage usage(Core::Process const& process);
 
 // After a fault ran out of RAM: frees memory by ending the app that holds
-// the most (never a system task). Returns the task ended (the current one
-// if it's the biggest app), or nullptr if there was none.
-Core::Task* outOfMemory(Core::Task* current);
+// the most (never a system process). Returns the process to end (the
+// current one, if it's the biggest app: the caller ends it), or nullptr if
+// there was none. Any other is ended here.
+Core::Process* outOfMemory(Core::Process* current);
 
 } // namespace Rudracore::Vm

@@ -9,6 +9,8 @@
 #include "arch/x86_64/protect.h"
 #include "core/channel.h"
 #include "core/device.h"
+#include "core/futex.h"
+#include "core/process.h"
 #include "core/programs.h"
 #include "core/random.h"
 #include "core/sched.h"
@@ -68,7 +70,8 @@ void makePrintable(char* text, u64 length) {
 // Everything a system call needs: the caller and its saved registers.
 struct Call {
     Arch::Frame* frame;
-    Task* task;
+    Task* task;               // the calling thread
+    Core::Process* process;   // its process
 
     u64 arg0() const { return frame->rdi; }
     u64 arg1() const { return frame->rsi; }
@@ -113,7 +116,7 @@ struct Call {
     // A live handle (open, not revoked) that has all of `rights`;
     // otherwise sets `error`.
     Core::Capability* capability(u64 handle, u32 rights, i64& error) const {
-        Core::Capability* cap = task->handle(handle);
+        Core::Capability* cap = process->handle(handle);
         if (not cap) {
             error = Abi::BAD_HANDLE;
             return nullptr;
@@ -168,7 +171,7 @@ struct Call {
 // A running task waits on nothing: clears it as the waiter of any channel
 // it holds (a registration left behind when a wait ended early).
 void forgetWaits(Task* task) {
-    for (auto& slot : task->handles) {
+    for (auto& slot : task->process->handles) {
         Object* object = slot.cap.object;
         if (object and object->type == ObjectType::Channel and static_cast<Core::Endpoint*>(object)->waiter == task)
             static_cast<Core::Endpoint*>(object)->waiter = nullptr;
@@ -184,20 +187,21 @@ bool isHardware(Object const* object) {
     case ObjectType::PciDevice:
     case ObjectType::Firmware: return true;
     case ObjectType::Memory: return static_cast<Core::SharedMemory const*>(object)->hardware;
-    case ObjectType::Channel: return false;
+    case ObjectType::Channel:
+    case ObjectType::Process: return false;
     }
     return true;
 }
 
 // What a new program started by `parent` is: init's programs are system
 // services, everything else is an app.
-Core::Privilege childPrivilege(Task const* parent) {
+Core::Privilege childPrivilege(Core::Process const* parent) {
     return parent->privilege == Core::Privilege::Root ? Core::Privilege::System : Core::Privilege::App;
 }
 
 // Resource limits by privilege: an app may hold a quarter of RAM and 256
 // kernel objects; system services half and 1024 (Sched::spawnUser's defaults).
-void setPrivilege(Task* task, Core::Privilege privilege) {
+void setPrivilege(Core::Process* task, Core::Privilege privilege) {
     task->privilege = privilege;
     if (privilege == Core::Privilege::App) {
         task->quota->limit = Pmm::stats().managedPages / 4;
@@ -208,7 +212,7 @@ void setPrivilege(Task* task, Core::Privilege privilege) {
 // Before handles move to a new app: none may be hardware.
 i64 checkNoHardware(Call const& c, Abi::Handle const* handles, u64 count) {
     for (u64 i = 0; i < count; i++) {
-        if (isHardware(c.task->handle(handles[i])->object))
+        if (isHardware(c.process->handle(handles[i])->object))
             return Abi::ACCESS_DENIED;
     }
     return Abi::OK;
@@ -245,8 +249,28 @@ Arch::Frame* sysLog(Call const& c) {
         length--;
     makePrintable(text, length);
 
-    log("[", c.task->name, "] ", Str{text, length});
+    log("[", c.process->name, "] ", Str{text, length});
     return c.result(Abi::OK);
+}
+
+// A free handle slot, for the process handle spawn may return: checked
+// before the child starts, so a full table can't leave it running unseen.
+bool hasFreeHandle(Core::Process const* p) {
+    for (u64 slot = 1; slot < Core::Process::MAX_HANDLES; slot++) {
+        if (not p->handles[slot].cap.object)
+            return true;
+    }
+    return false;
+}
+
+constexpr u32 PROCESS_RIGHTS = Abi::RIGHT_READ | Abi::RIGHT_WRITE | Abi::RIGHT_TRANSFER | Abi::RIGHT_DUPLICATE;
+
+// What spawn returns: the child's id, or a handle to it (SPAWN_HANDLE).
+Arch::Frame* spawned(Call const& c, Task* child, u64 flags) {
+    if (not(flags & Abi::SPAWN_HANDLE))
+        return c.result(static_cast<i64>(child->id));
+    auto* object = new Core::ProcessObject(child->process);
+    return c.result(static_cast<i64>(c.process->addHandle({object, PROCESS_RIGHTS, 0})));
 }
 
 Arch::Frame* sysSpawn(Call const& c) {
@@ -254,12 +278,16 @@ Arch::Frame* sysSpawn(Call const& c) {
     u64 nameLength = c.arg1();
     u64 handlesAddress = c.arg2();
     u64 handleCount = c.arg3();
+    u64 flags = c.arg4();
 
     char name[32];
-    if (c.task->privilege == Core::Privilege::App)
+    if (c.process->privilege == Core::Privilege::App)
         return c.result(Abi::ACCESS_DENIED); // apps can't start programs
-    if (nameLength == 0 or nameLength >= sizeof(name) or handleCount > MAX_SPAWN_HANDLES)
+    if (nameLength == 0 or nameLength >= sizeof(name) or handleCount > MAX_SPAWN_HANDLES or
+        (flags & ~(Abi::SPAWN_HANDLE | Abi::SPAWN_NEW_GROUP)))
         return c.result(Abi::INVALID_ARGUMENT);
+    if ((flags & Abi::SPAWN_HANDLE) and not hasFreeHandle(c.process))
+        return c.result(Abi::NO_SPACE);
     if (not c.userMemory(nameAddress, nameLength) or
         not c.userMemory(handlesAddress, handleCount * sizeof(Abi::Handle)))
         return c.result(Abi::BAD_ADDRESS);
@@ -278,32 +306,33 @@ Arch::Frame* sysSpawn(Call const& c) {
     fromUser(handles, handlesAddress, handleCount * sizeof(Abi::Handle));
     if (i64 bad = c.checkMovable(handles, handleCount, false, Abi::NO_HANDLE))
         return c.result(bad);
-    Core::Privilege privilege = childPrivilege(c.task);
+    Core::Privilege privilege = childPrivilege(c.process);
     if (privilege == Core::Privilege::App)
         if (i64 bad = checkNoHardware(c, handles, handleCount))
             return c.result(bad);
 
     Core::Capability objects[MAX_SPAWN_HANDLES];
     for (u64 i = 0; i < handleCount; i++)
-        objects[i] = c.task->takeHandle(handles[i]);
+        objects[i] = c.process->takeHandle(handles[i]);
 
     Abi::Error code = Abi::OK;
     char const* error = nullptr;
-    Task* child = Programs::start(name, nameLength, objects, handleCount, code, error);
+    Task* child = Programs::start(name, nameLength, objects, handleCount, code, error, c.process,
+                                  flags & Abi::SPAWN_NEW_GROUP);
     if (not child) {
-        log("[sched] ", c.task->name, " can't start ", static_cast<char const*>(name), ": ", error);
+        log("[sched] ", c.process->name, " can't start ", static_cast<char const*>(name), ": ", error);
         return c.result(code);
     }
-    setPrivilege(child, privilege);
+    setPrivilege(child->process, privilege);
 
-    log("[sched] ", c.task->name, " started ", child->name, " as task ", child->id,
+    log("[sched] ", c.process->name, " started ", child->name, " as task ", child->id,
         " with ", handleCount, " handle(s)");
-    return c.result(static_cast<i64>(child->id));
+    return spawned(c, child, flags);
 }
 
 Arch::Frame* sysSpawnImage(Call const& c) {
     Abi::SpawnImage request;
-    if (c.task->privilege == Core::Privilege::App)
+    if (c.process->privilege == Core::Privilege::App)
         return c.result(Abi::ACCESS_DENIED);
     if (not c.userMemory(c.arg0(), sizeof(request)))
         return c.result(Abi::BAD_ADDRESS);
@@ -313,8 +342,12 @@ Arch::Frame* sysSpawnImage(Call const& c) {
     while (request.name[nameLength])
         nameLength++;
     makePrintable(request.name, nameLength);
-    if (request.handleCount > MAX_SPAWN_HANDLES or request.name[0] == '\0')
+    u64 flags = c.arg1();
+    if (request.handleCount > MAX_SPAWN_HANDLES or request.name[0] == '\0' or
+        (flags & ~(Abi::SPAWN_HANDLE | Abi::SPAWN_NEW_GROUP)))
         return c.result(Abi::INVALID_ARGUMENT);
+    if ((flags & Abi::SPAWN_HANDLE) and not hasFreeHandle(c.process))
+        return c.result(Abi::NO_SPACE);
 
     i64 error = 0;
     auto* memory = c.lookup<Core::SharedMemory>(request.memory, ObjectType::Memory, Abi::RIGHT_READ, error);
@@ -328,19 +361,19 @@ Arch::Frame* sysSpawnImage(Call const& c) {
     Core::SharedMemory* image = memory;
     if (not memory->sealed) {
         u64 pages = Mem::alignUp(request.size, Mem::PAGE_SIZE) / Mem::PAGE_SIZE;
-        if (not c.task->quota->chargeObjects(1))
+        if (not c.process->quota->chargeObjects(1))
             return c.result(Abi::OUT_OF_MEMORY);
-        if (not c.task->quota->charge(pages)) {
-            c.task->quota->refundObjects(1);
+        if (not c.process->quota->charge(pages)) {
+            c.process->quota->refundObjects(1);
             return c.result(Abi::OUT_OF_MEMORY);
         }
         image = Core::SharedMemory::allocate(request.size);
         if (not image) {
-            c.task->quota->refund(pages);
-            c.task->quota->refundObjects(1);
+            c.process->quota->refund(pages);
+            c.process->quota->refundObjects(1);
             return c.result(Abi::OUT_OF_MEMORY);
         }
-        image->chargeTo(c.task->quota, pages);
+        image->chargeTo(c.process->quota, pages);
         memcpy(Mem::toVirtual<u8>(image->physical), Mem::toVirtual<u8>(memory->physical), request.size);
         image->readOnly = image->sealed = true;
     } else {
@@ -358,20 +391,21 @@ Arch::Frame* sysSpawnImage(Call const& c) {
     }
     Core::Capability objects[MAX_SPAWN_HANDLES];
     for (u64 i = 0; i < request.handleCount; i++)
-        objects[i] = c.task->takeHandle(request.handles[i]);
+        objects[i] = c.process->takeHandle(request.handles[i]);
 
     Abi::Error code = Abi::OK;
     char const* why = nullptr;
-    Task* child = Programs::startImage(request.name, image, request.size, objects, request.handleCount, code, why);
+    Task* child = Programs::startImage(request.name, image, request.size, objects, request.handleCount, code, why,
+                                       c.process, flags & Abi::SPAWN_NEW_GROUP);
     image->unref(); // (the app's regions hold their own references)
     if (not child) {
-        log("[sched] ", c.task->name, " can't start the app ", static_cast<char const*>(request.name), ": ", why);
+        log("[sched] ", c.process->name, " can't start the app ", static_cast<char const*>(request.name), ": ", why);
         return c.result(code);
     }
-    setPrivilege(child, Core::Privilege::App);
-    log("[sched] ", c.task->name, " started the app ", child->name, " as task ", child->id, " with ",
+    setPrivilege(child->process, Core::Privilege::App);
+    log("[sched] ", c.process->name, " started the app ", child->name, " as task ", child->id, " with ",
         request.handleCount, " handle(s)");
-    return c.result(static_cast<i64>(child->id));
+    return spawned(c, child, flags);
 }
 
 Arch::Frame* sysSystemInfo(Call const& c, Boot::Info const& boot) {
@@ -389,7 +423,7 @@ Arch::Frame* sysSystemInfo(Call const& c, Boot::Info const& boot) {
     info.timeOfDay = Time::timeOfDay();
     info.unixTime = Time::unixTime();
     info.bootMode = boot.mode;
-    if (c.task->privilege != Core::Privilege::App)
+    if (c.process->privilege != Core::Privilege::App)
         info.acpiRsdp = boot.acpiRsdp;
     if (boot.hasFramebuffer) {
         auto const& fb = boot.framebuffer;
@@ -412,8 +446,8 @@ Arch::Frame* sysTaskList(Call const& c) {
     if (not c.userMemory(c.arg0(), capacity * sizeof(Abi::TaskInfo), true))
         return c.result(Abi::BAD_ADDRESS);
     u64 count = 0;
-    for (Task* t = Sched::allTasks(); t; t = t->allNext) {
-        if (t->state == Core::TaskState::Dead)
+    for (Core::Process* t = Proc::all(); t; t = t->allNext) {
+        if (t->exited)
             continue;
         if (count < capacity) {
             Abi::TaskInfo info;
@@ -424,9 +458,14 @@ Arch::Frame* sysTaskList(Call const& c) {
             info.privilege = t->privilege == Core::Privilege::Root     ? Abi::TASK_ROOT
                              : t->privilege == Core::Privilege::System ? Abi::TASK_SYSTEM
                                                                        : Abi::TASK_APP;
-            info.state = t->state == Core::TaskState::Running ? Abi::TASK_RUNNING
-                         : t->state == Core::TaskState::Ready ? Abi::TASK_READY
-                                                              : Abi::TASK_WAITING;
+            info.state = Abi::TASK_WAITING;
+            for (Task* thread = t->threads; thread; thread = thread->threadNext) {
+                if (thread->state == Core::TaskState::Running)
+                    info.state = Abi::TASK_RUNNING;
+                else if (thread->state == Core::TaskState::Ready and info.state == Abi::TASK_WAITING)
+                    info.state = Abi::TASK_READY;
+            }
+            info.threads = static_cast<unsigned short>(t->liveThreads);
             info.cpuMs = t->cpuMs;
             Vm::Usage u = Vm::usage(*t);
             info.regions = u.regions;
@@ -488,7 +527,7 @@ Arch::Frame* sysFileOpen(Call const& c) {
     if (not memory)
         return c.result(Abi::NOT_FOUND);
     memory->ref();
-    u64 handle = c.task->addHandle({memory, FILE_RIGHTS, memory->epoch});
+    u64 handle = c.process->addHandle({memory, FILE_RIGHTS, memory->epoch});
     if (not handle) {
         memory->unref();
         return c.result(Abi::NO_SPACE);
@@ -499,7 +538,7 @@ Arch::Frame* sysFileOpen(Call const& c) {
 // MARK: Handles and channels
 
 Arch::Frame* sysHandleClose(Call const& c) {
-    Object* object = c.task->takeHandle(c.arg0()).object;
+    Object* object = c.process->takeHandle(c.arg0()).object;
     if (not object)
         return c.result(Abi::BAD_HANDLE);
     // The endpoint may live on (other handles): it must not keep naming this task.
@@ -516,7 +555,7 @@ Arch::Frame* sysHandleDuplicate(Call const& c) {
         return c.result(error);
     Core::Capability copy{cap->object, cap->rights & static_cast<u32>(c.arg1()), cap->epoch};
     copy.object->ref();
-    u64 handle = c.task->addHandle(copy);
+    u64 handle = c.process->addHandle(copy);
     if (not handle) {
         copy.object->unref();
         return c.result(Abi::NO_SPACE);
@@ -564,11 +603,12 @@ Arch::Frame* sysHandleRevoke(Call const& c) {
         }
         break;
     case ObjectType::Memory:
-        Vm::revoke(static_cast<Core::SharedMemory*>(object), c.task);
+        Vm::revoke(static_cast<Core::SharedMemory*>(object), c.process);
         break;
     case ObjectType::IoPorts:
     case ObjectType::PciDevice:
     case ObjectType::Firmware:
+    case ObjectType::Process:
         break;
     }
     return c.result(Abi::OK);
@@ -581,18 +621,18 @@ Arch::Frame* sysChannelCreate(Call const& c) {
     // Two endpoints, each a little over one page of kernel heap.
     if (not Pmm::userCanUse(2 * (sizeof(Core::Endpoint) / Mem::PAGE_SIZE + 1)))
         return c.result(Abi::OUT_OF_MEMORY);
-    if (not c.task->quota->chargeObjects(2))
+    if (not c.process->quota->chargeObjects(2))
         return c.result(Abi::OUT_OF_MEMORY);
 
     Core::Endpoint *a, *b;
     Core::Endpoint::createPair(a, b);
-    a->chargeTo(c.task->quota, 0);
-    b->chargeTo(c.task->quota, 0);
-    u64 ha = c.task->addHandle({a, CHANNEL_RIGHTS, 0});
-    u64 hb = ha ? c.task->addHandle({b, CHANNEL_RIGHTS, 0}) : 0;
+    a->chargeTo(c.process->quota, 0);
+    b->chargeTo(c.process->quota, 0);
+    u64 ha = c.process->addHandle({a, CHANNEL_RIGHTS, 0});
+    u64 hb = ha ? c.process->addHandle({b, CHANNEL_RIGHTS, 0}) : 0;
     if (not hb) {
         if (ha)
-            c.task->takeHandle(ha);
+            c.process->takeHandle(ha);
         a->unref();
         b->unref();
         return c.result(Abi::NO_SPACE);
@@ -635,7 +675,7 @@ Arch::Frame* sysChannelSend(Call const& c) {
     // Refuse every way to start one: sending the receiving endpoint into its
     // own queue, an endpoint that already holds channels or IRQs in its
     // queue, or an IRQ bound to a channel.
-    if (Object* object = attach != Abi::NO_HANDLE ? c.task->handle(attach)->object : nullptr) {
+    if (Object* object = attach != Abi::NO_HANDLE ? c.process->handle(attach)->object : nullptr) {
         if (object == peer)
             return c.result(Abi::INVALID_ARGUMENT);
         if (object->type == ObjectType::Channel and static_cast<Core::Endpoint*>(object)->holdsLinks())
@@ -647,7 +687,7 @@ Arch::Frame* sysChannelSend(Call const& c) {
     Core::Message message;
     fromUser(message.data, address, length);
     message.size = static_cast<u32>(length);
-    message.attached = attach != Abi::NO_HANDLE ? c.task->takeHandle(attach) : Core::Capability{};
+    message.attached = attach != Abi::NO_HANDLE ? c.process->takeHandle(attach) : Core::Capability{};
     peer->push(message);
     return c.result(Abi::OK);
 }
@@ -688,9 +728,9 @@ Arch::Frame* sysChannelRecv(Call const& c) {
     // ask for.
     u64 received = Abi::NO_HANDLE;
     Core::Capability& attached = message.attached;
-    bool refused = attached.object and c.task->privilege == Core::Privilege::App and isHardware(attached.object);
+    bool refused = attached.object and c.process->privilege == Core::Privilege::App and isHardware(attached.object);
     if (attached.object and handleOut and not attached.revoked() and not refused) {
-        received = c.task->addHandle(attached);
+        received = c.process->addHandle(attached);
         if (not received)
             return c.result(Abi::NO_SPACE);
     } else if (attached.object) {
@@ -772,14 +812,14 @@ Arch::Frame* sysWait(Call const& c) {
 
 // Any region: shared memory, private memory, a mapped file.
 Arch::Frame* sysMemoryUnmap(Call const& c) {
-    return c.result(Vm::unmap(*c.task, c.arg0()));
+    return c.result(Vm::unmap(*c.process, c.arg0()));
 }
 
 Arch::Frame* sysMemoryCreate(Call const& c) {
     if (c.arg0() == 0 or c.arg0() > Core::SharedMemory::MAX_SIZE or (c.arg1() & ~Abi::MEMORY_BELOW_4G))
         return c.result(Abi::INVALID_ARGUMENT);
     u64 pages = Mem::alignUp(c.arg0(), Mem::PAGE_SIZE) / Mem::PAGE_SIZE;
-    Core::Quota& quota = *c.task->quota;
+    Core::Quota& quota = *c.process->quota;
     if (not quota.chargeObjects(1))
         return c.result(Abi::OUT_OF_MEMORY);
     if (not quota.charge(pages)) {
@@ -794,7 +834,7 @@ Arch::Frame* sysMemoryCreate(Call const& c) {
     }
     memory->chargeTo(&quota, pages);
 
-    u64 handle = c.task->addHandle({memory, MEMORY_RIGHTS, 0});
+    u64 handle = c.process->addHandle({memory, MEMORY_RIGHTS, 0});
     if (not handle) {
         memory->unref();
         return c.result(Abi::NO_SPACE);
@@ -819,9 +859,9 @@ Arch::Frame* sysMemoryMap(Call const& c) {
     // read-only or sealed object. A copy writes only its own pages.
     bool writable = not(flags & Abi::MAP_READ_ONLY) and
                     (copy or (not memory->readOnly and not memory->sealed and
-                              (c.task->handle(c.arg0())->rights & Abi::RIGHT_WRITE)));
+                              (c.process->handle(c.arg0())->rights & Abi::RIGHT_WRITE)));
     u64 address = 0;
-    i64 result = Vm::mapObject(*c.task, memory, copy ? Vm::Kind::Copy : Vm::Kind::Shared, 0, memory->size,
+    i64 result = Vm::mapObject(*c.process, memory, copy ? Vm::Kind::Copy : Vm::Kind::Shared, 0, memory->size,
                                memory->size, writable, false, 0, address);
     if (result != Abi::OK)
         return c.result(result);
@@ -843,7 +883,7 @@ Arch::Frame* sysMemoryAlloc(Call const& c) {
     if (not Pmm::userCanUse(pages / 512 + 3))
         return c.result(Abi::OUT_OF_MEMORY);
     u64 address = 0;
-    i64 result = Vm::mapAnonymous(*c.task, size, true, 0, address);
+    i64 result = Vm::mapAnonymous(*c.process, size, true, 0, address);
     return c.result(result == Abi::OK ? static_cast<i64>(address) : result);
 }
 
@@ -851,7 +891,7 @@ Arch::Frame* sysMemoryAlloc(Call const& c) {
 Arch::Frame* sysMemoryProtect(Call const& c) {
     if (c.arg1() > 1)
         return c.result(Abi::INVALID_ARGUMENT);
-    return c.result(Vm::protect(*c.task, c.arg0(), c.arg1()));
+    return c.result(Vm::protect(*c.process, c.arg0(), c.arg1()));
 }
 
 // Seals a memory object: its contents never change again, for anyone.
@@ -900,20 +940,20 @@ Arch::Frame* sysMemoryCreatePaged(Call const& c) {
         return c.result(error);
     if (end->pagerOf or not end->peer or end->waiter)
         return c.result(Abi::INVALID_ARGUMENT);
-    if (not Pmm::userCanUse(c.arg0() / Mem::PAGE_SIZE / 512 + 1) or not c.task->quota->chargeObjects(1))
+    if (not Pmm::userCanUse(c.arg0() / Mem::PAGE_SIZE / 512 + 1) or not c.process->quota->chargeObjects(1))
         return c.result(Abi::OUT_OF_MEMORY);
     auto* memory = Core::SharedMemory::createPaged(c.arg0(), end);
     if (not memory) {
-        c.task->quota->refundObjects(1);
+        c.process->quota->refundObjects(1);
         return c.result(Abi::OUT_OF_MEMORY);
     }
-    memory->chargeTo(c.task->quota, 0);
-    u64 handle = c.task->addHandle({memory, MEMORY_RIGHTS & ~Abi::RIGHT_WRITE, 0});
+    memory->chargeTo(c.process->quota, 0);
+    u64 handle = c.process->addHandle({memory, MEMORY_RIGHTS & ~Abi::RIGHT_WRITE, 0});
     if (not handle) {
         memory->unref();
         return c.result(Abi::NO_SPACE);
     }
-    c.task->takeHandle(c.arg1()).object->unref(); // the kernel's reference (createPaged's) keeps it
+    c.process->takeHandle(c.arg1()).object->unref(); // the kernel's reference (createPaged's) keeps it
     return c.result(static_cast<i64>(handle));
 }
 
@@ -1048,7 +1088,7 @@ Arch::Frame* sysDeviceBar(Call const& c) {
 
     auto const& bar = device->bars[index];
     auto* memory = Core::SharedMemory::device(bar.address, bar.size, Vmm::Cache::Uncached);
-    u64 handle = c.task->addHandle({memory, REGISTER_RIGHTS, 0});
+    u64 handle = c.process->addHandle({memory, REGISTER_RIGHTS, 0});
     if (not handle) {
         memory->unref();
         return c.result(Abi::NO_SPACE);
@@ -1068,7 +1108,7 @@ Arch::Frame* sysDeviceMsi(Call const& c) {
     auto* irq = Core::Irq::forDevice(device->address, error);
     if (not irq)
         return c.result(error);
-    u64 handle = c.task->addHandle({irq, Abi::RIGHT_READ, 0});
+    u64 handle = c.process->addHandle({irq, Abi::RIGHT_READ, 0});
     if (not handle) {
         irq->unref();
         return c.result(Abi::NO_SPACE);
@@ -1137,7 +1177,7 @@ Arch::Frame* sysFirmwareMemory(Call const& c, Boot::Info const& boot) {
     }
     auto* memory = Core::SharedMemory::device(start, end - start,
                                               tables ? Vmm::Cache::WriteBack : Vmm::Cache::Uncached);
-    u64 handle = c.task->addHandle({memory, Abi::RIGHT_READ | Abi::RIGHT_WRITE, 0});
+    u64 handle = c.process->addHandle({memory, Abi::RIGHT_READ | Abi::RIGHT_WRITE, 0});
     if (not handle) {
         memory->unref();
         return c.result(Abi::NO_SPACE);
@@ -1204,7 +1244,7 @@ Arch::Frame* sysFirmwarePerformance(Call const& c) {
 
 // Turns the machine off or restarts it (ACPI). Not for apps.
 Arch::Frame* sysPower(Call const& c) {
-    if (c.task->privilege == Core::Privilege::App)
+    if (c.process->privilege == Core::Privilege::App)
         return c.result(Abi::ACCESS_DENIED);
     if (c.arg0() == Abi::POWER_RESTART)
         Arch::Acpi::reboot();
@@ -1215,7 +1255,7 @@ Arch::Frame* sysPower(Call const& c) {
 }
 
 Arch::Frame* sysBootComplete(Call const& c) {
-    if (c.task->privilege == Core::Privilege::App)
+    if (c.process->privilege == Core::Privilege::App)
         return c.result(Abi::ACCESS_DENIED);
     static i64 outcome = 1; // (once per boot: later calls get the same answer)
     if (outcome == 1) {
@@ -1255,6 +1295,267 @@ Arch::Frame* sysDmaAddress(Call const& c) {
     return c.result(static_cast<i64>(memory->physical));
 }
 
+// MARK: Threads and processes
+
+// Timed waits that block and run the call again (join, futex, process
+// wait): the deadline is set on the first run and kept across runs.
+bool pastDeadline(Task* t, u64 timeout) {
+    u64 now = Time::now();
+    if (timeout != Abi::WAIT_FOREVER and not t->waitDeadline)
+        t->waitDeadline = now + min(timeout, MAX_TIMEOUT_MS);
+    return t->waitDeadline and now >= t->waitDeadline;
+}
+
+Arch::Frame* waitAgain(Call const& c) {
+    c.frame->rip -= INT80_LENGTH;
+    if (c.task->waitDeadline)
+        return Sched::blockCurrentUntil(c.frame, c.task->waitDeadline);
+    return Sched::blockCurrent(c.frame);
+}
+
+Arch::Frame* finishWait(Call const& c, i64 result) {
+    c.task->waitDeadline = 0;
+    return c.result(result);
+}
+
+Arch::Frame* sysThreadCreate(Call const& c) {
+    u64 entry = c.arg0(), stack = c.arg1(), tls = c.arg3();
+    if (entry >= Vmm::USER_END or stack >= Vmm::USER_END or tls >= Vmm::USER_END)
+        return c.result(Abi::INVALID_ARGUMENT);
+    if (c.process->liveThreads >= c.process->threadLimit)
+        return c.result(Abi::NO_SPACE);
+    if (not Pmm::userCanUse(8)) // its kernel stack and state
+        return c.result(Abi::OUT_OF_MEMORY);
+    Task* thread = Sched::createThread(c.process, entry, stack, c.arg2(), tls);
+    return c.result(thread ? static_cast<i64>(thread->id) : Abi::OUT_OF_MEMORY);
+}
+
+Arch::Frame* sysThreadSetTls(Call const& c) {
+    if (c.arg0() >= Vmm::USER_END)
+        return c.result(Abi::INVALID_ARGUMENT);
+    Sched::setThreadBase(c.task, c.arg0());
+    return c.result(Abi::OK);
+}
+
+// (thread, long* code, timeout)
+Arch::Frame* sysThreadJoin(Call const& c) {
+    u64 target = c.arg0(), codeAddress = c.arg1();
+    if (target == c.task->id)
+        return finishWait(c, Abi::INVALID_ARGUMENT);
+    if (codeAddress and not c.userMemory(codeAddress, sizeof(i64), true))
+        return finishWait(c, Abi::BAD_ADDRESS);
+    c.task->joinTarget = 0;
+    i64 code = 0;
+    if (Proc::takeFinished(c.process, target, code)) {
+        if (codeAddress)
+            toUser(codeAddress, &code, sizeof(code));
+        return finishWait(c, Abi::OK);
+    }
+    bool alive = false;
+    for (Task* t = c.process->threads; t; t = t->threadNext)
+        alive = alive or (t->id == target and t->state != Core::TaskState::Dead);
+    if (not alive)
+        return finishWait(c, Abi::NOT_FOUND);
+    if (pastDeadline(c.task, c.arg2()))
+        return finishWait(c, Abi::TIMED_OUT);
+    c.task->joinTarget = target; // Proc::threadEnded wakes it
+    return waitAgain(c);
+}
+
+// The key a futex word is known by: its physical address (shared by every
+// process that maps the same memory). 0 if it isn't mapped.
+u64 futexKey(Call const& c, u64 address) {
+    u64 physical = 0;
+    return c.process->space->translate(address, physical) ? physical : 0;
+}
+
+// (u32* address, u32 expected, timeout)
+Arch::Frame* sysFutexWait(Call const& c) {
+    u64 address = c.arg0();
+    if (c.task->futexWoken) { // the run after futex_wake woke it
+        c.task->futexWoken = false;
+        return finishWait(c, Abi::OK);
+    }
+    Futex::forget(c.task); // (a run after a timeout)
+    if (address % 4)
+        return finishWait(c, Abi::INVALID_ARGUMENT);
+    if (not c.userMemory(address, 4))
+        return finishWait(c, Abi::BAD_ADDRESS);
+    u32 value;
+    fromUser(&value, address, sizeof(value));
+    if (value != static_cast<u32>(c.arg1()))
+        return finishWait(c, Abi::WOULD_BLOCK);
+    if (pastDeadline(c.task, c.arg2()))
+        return finishWait(c, Abi::TIMED_OUT);
+    // Interrupts are off from the check to the block: no wake can slip between.
+    Futex::wait(c.task, futexKey(c, address));
+    return waitAgain(c);
+}
+
+Arch::Frame* sysFutexWake(Call const& c) {
+    u64 address = c.arg0();
+    if (address % 4)
+        return c.result(Abi::INVALID_ARGUMENT);
+    if (not c.userMemory(address, 4))
+        return c.result(Abi::BAD_ADDRESS);
+    return c.result(static_cast<i64>(Futex::wake(futexKey(c, address), c.arg1())));
+}
+
+Core::Process* processFor(Call const& c, u64 handle, u32 rights, i64& error) {
+    auto* object = c.lookup<Core::ProcessObject>(handle, ObjectType::Process, rights, error);
+    return object ? object->process : nullptr;
+}
+
+// (Handle process, long* code, timeout)
+Arch::Frame* sysProcessWait(Call const& c) {
+    i64 error = 0;
+    Core::Process* p = processFor(c, c.arg0(), Abi::RIGHT_READ, error);
+    c.task->exitWaitTarget = nullptr;
+    if (not p)
+        return finishWait(c, error);
+    if (c.arg1() and not c.userMemory(c.arg1(), sizeof(i64), true))
+        return finishWait(c, Abi::BAD_ADDRESS);
+    if (p->exited) {
+        if (c.arg1())
+            toUser(c.arg1(), &p->exitCode, sizeof(p->exitCode));
+        return finishWait(c, Abi::OK);
+    }
+    if (pastDeadline(c.task, c.arg2()))
+        return finishWait(c, Abi::TIMED_OUT);
+    c.task->exitWaitTarget = p; // Proc::wakeExitWaiters wakes it
+    return waitAgain(c);
+}
+
+// An event for `target`, if it listens; false if it doesn't (or its queue is full).
+bool postEvent(Core::Process* target, u64 kind, u64 from) {
+    Core::Endpoint* to = target->events ? target->events->peer : nullptr;
+    if (not to or to->full())
+        return false;
+    Core::Message m{};
+    Abi::Event event{kind, from};
+    memcpy(m.data, &event, sizeof(event));
+    m.size = sizeof(event);
+    to->push(m);
+    return true;
+}
+
+// (Handle process, signal, flags)
+Arch::Frame* sysProcessSignal(Call const& c) {
+    i64 error = 0;
+    Core::Process* target = processFor(c, c.arg0(), Abi::RIGHT_WRITE, error);
+    u64 signal = c.arg1(), flags = c.arg2();
+    if (not target)
+        return c.result(error);
+    if (signal < Abi::SIGNAL_KILL or signal > Abi::SIGNAL_INTERRUPT or (flags & ~Abi::SIGNAL_GROUP))
+        return c.result(Abi::INVALID_ARGUMENT);
+
+    // Who gets it: the process, or its whole group (ids first: ending one
+    // changes the list).
+    constexpr usize MAX = 128;
+    u64 ids[MAX];
+    usize count = 0;
+    if (flags & Abi::SIGNAL_GROUP) {
+        for (Core::Process* p = Proc::all(); p and count < MAX; p = p->allNext) {
+            if (p->group == target->group and not p->exited)
+                ids[count++] = p->id;
+        }
+    } else {
+        ids[count++] = target->id;
+    }
+
+    bool denied = false, endSelf = false;
+    for (usize i = 0; i < count; i++) {
+        Core::Process* p = Proc::find(ids[i]);
+        if (not p or p->exited)
+            continue;
+        if (c.process->privilege == Core::Privilege::App and p->privilege != Core::Privilege::App) {
+            denied = true; // an app signals only apps
+            continue;
+        }
+        bool asked = signal != Abi::SIGNAL_KILL and
+                     postEvent(p, signal == Abi::SIGNAL_TERMINATE ? Abi::EVENT_TERMINATE : Abi::EVENT_INTERRUPT,
+                               c.process->id);
+        if (asked or signal == Abi::SIGNAL_INTERRUPT)
+            continue;
+        if (p == c.process)
+            endSelf = true;
+        else
+            Sched::endProcess(p, Abi::EXIT_KILLED);
+    }
+    if (endSelf)
+        return Sched::exitProcess(c.frame, Abi::EXIT_KILLED);
+    return c.result(denied and count == 1 ? Abi::ACCESS_DENIED : Abi::OK);
+}
+
+// (Handle process or NO_HANDLE, limit, value): only ever lowered.
+Arch::Frame* sysProcessLimit(Call const& c) {
+    i64 error = 0;
+    Core::Process* p = c.arg0() == Abi::NO_HANDLE ? c.process : processFor(c, c.arg0(), Abi::RIGHT_WRITE, error);
+    if (not p)
+        return c.result(error);
+    u64 value = c.arg2();
+    if (p->exited or not p->quota)
+        return c.result(Abi::OK);
+    switch (c.arg1()) {
+    case Abi::LIMIT_MEMORY:
+        p->quota->limit = min(p->quota->limit, value / Mem::PAGE_SIZE);
+        break;
+    case Abi::LIMIT_OBJECTS:
+        p->quota->objectLimit = min(p->quota->objectLimit, value);
+        break;
+    case Abi::LIMIT_THREADS:
+        p->threadLimit = static_cast<u32>(min(u64{p->threadLimit}, value));
+        break;
+    case Abi::LIMIT_CPU_MS:
+        if (value)
+            p->cpuLimitMs = p->cpuLimitMs ? min(p->cpuLimitMs, value) : value;
+        break;
+    default: return c.result(Abi::INVALID_ARGUMENT);
+    }
+    return c.result(Abi::OK);
+}
+
+// (Handle endpoint or NO_HANDLE): where this process's events go.
+Arch::Frame* sysProcessEvents(Call const& c) {
+    Core::Endpoint* endpoint = nullptr;
+    if (c.arg0() != Abi::NO_HANDLE) {
+        i64 error = 0;
+        endpoint = c.lookup<Core::Endpoint>(c.arg0(), ObjectType::Channel, Abi::RIGHT_WRITE, error);
+        if (not endpoint)
+            return c.result(error);
+        if (endpoint->pagerOf)
+            return c.result(Abi::INVALID_ARGUMENT);
+        c.process->takeHandle(c.arg0()); // the reference moves to the process's events
+    }
+    if (c.process->events)
+        c.process->events->unref();
+    c.process->events = endpoint;
+    return c.result(Abi::OK);
+}
+
+Arch::Frame* sysProcessInfo(Call const& c) {
+    i64 error = 0;
+    Core::Process* p = processFor(c, c.arg0(), Abi::RIGHT_READ, error);
+    if (not p)
+        return c.result(error);
+    if (not c.userMemory(c.arg1(), sizeof(Abi::ProcessInfo), true))
+        return c.result(Abi::BAD_ADDRESS);
+    Abi::ProcessInfo info;
+    memset(&info, 0, sizeof(info));
+    info.id = p->id;
+    info.group = p->group;
+    info.parent = p->parent;
+    info.threads = p->liveThreads;
+    info.exitCode = p->exitCode;
+    info.exited = p->exited;
+    info.cpuMs = p->cpuMs;
+    info.faultVector = p->faultVector;
+    info.faultAddress = p->faultAddress;
+    info.faultRip = p->faultRip;
+    toUser(c.arg1(), &info, sizeof(info));
+    return c.result(Abi::OK);
+}
+
 Boot::Info const* bootInfo = nullptr;
 
 } // namespace
@@ -1270,7 +1571,8 @@ Arch::Frame* run(Call const& c);
 } // namespace
 
 Arch::Frame* dispatch(Arch::Frame* frame) {
-    Call c{frame, Sched::current()};
+    Task* caller = Sched::current();
+    Call c{frame, caller, caller->process};
     if (not c.task->isUser())
         return c.result(Abi::UNKNOWN_SYSCALL); // kernel tasks use Sched directly
     u64 number = frame->rax;
@@ -1292,9 +1594,9 @@ Arch::Frame* dispatch(Arch::Frame* frame) {
         again();
         return Sched::sleepCurrent(frame, 1);
     case Call::Wait::OutOfMemory:
-        if (Task* victim = Vm::outOfMemory(c.task)) {
-            if (victim == c.task)
-                return Sched::exitCurrent(frame, -1);
+        if (Core::Process* victim = Vm::outOfMemory(c.process)) {
+            if (victim == c.process)
+                return Sched::exitProcess(frame, Abi::EXIT_OUT_OF_MEMORY);
             again(); // another app's memory is free now
             return frame;
         }
@@ -1312,14 +1614,14 @@ Arch::Frame* run(Call const& c) {
     Arch::Frame* frame = c.frame;
     switch (frame->rax) {
     case Abi::SYS_LOG: return sysLog(c);
-    case Abi::SYS_EXIT: return Sched::exitCurrent(frame, static_cast<i64>(c.arg0()));
+    case Abi::SYS_EXIT: return Sched::exitProcess(frame, static_cast<i64>(c.arg0()));
     case Abi::SYS_YIELD:
         c.result(Abi::OK);
         return Sched::switchFrom(frame);
     case Abi::SYS_SLEEP:
         c.result(Abi::OK);
         return Sched::sleepCurrent(frame, min(c.arg0(), MAX_TIMEOUT_MS));
-    case Abi::SYS_TASK_ID: return c.result(static_cast<i64>(c.task->id));
+    case Abi::SYS_TASK_ID: return c.result(static_cast<i64>(c.process->id));
     case Abi::SYS_TIME: return c.result(static_cast<i64>(Time::now()));
     case Abi::SYS_SPAWN: return sysSpawn(c);
     case Abi::SYS_SPAWN_IMAGE: return sysSpawnImage(c);
@@ -1366,6 +1668,19 @@ Arch::Frame* run(Call const& c) {
     case Abi::SYS_FIRMWARE_PERFORMANCE: return sysFirmwarePerformance(c);
     case Abi::SYS_TASK_LIST: return sysTaskList(c);
     case Abi::SYS_KERNEL_STATS: return sysKernelStats(c);
+
+    case Abi::SYS_THREAD_CREATE: return sysThreadCreate(c);
+    case Abi::SYS_THREAD_EXIT: return Sched::exitThread(frame, static_cast<i64>(c.arg0()));
+    case Abi::SYS_THREAD_ID: return c.result(static_cast<i64>(c.task->id));
+    case Abi::SYS_THREAD_JOIN: return sysThreadJoin(c);
+    case Abi::SYS_THREAD_SET_TLS: return sysThreadSetTls(c);
+    case Abi::SYS_FUTEX_WAIT: return sysFutexWait(c);
+    case Abi::SYS_FUTEX_WAKE: return sysFutexWake(c);
+    case Abi::SYS_PROCESS_WAIT: return sysProcessWait(c);
+    case Abi::SYS_PROCESS_SIGNAL: return sysProcessSignal(c);
+    case Abi::SYS_PROCESS_LIMIT: return sysProcessLimit(c);
+    case Abi::SYS_PROCESS_EVENTS: return sysProcessEvents(c);
+    case Abi::SYS_PROCESS_INFO: return sysProcessInfo(c);
 
     default: return c.result(Abi::UNKNOWN_SYSCALL);
     }

@@ -155,9 +155,79 @@ enum Syscall : unsigned long {
                                    //   server's thermal throttling (passive cooling) caps the CPU at
                                    //   that share of its performance; 100 lifts the cap. NOT_FOUND if
                                    //   the CPU has no way (no HWP, no clock modulation).
-    SYS_TASK_LIST = 47,    // (TaskInfo* out, usize capacity) -> how many tasks exist (up to `capacity` of
-                           //   them are written): each one's name, CPU time and memory.
+    SYS_TASK_LIST = 47,    // (TaskInfo* out, usize capacity) -> how many processes are running (up to
+                           //   `capacity` of them are written): each one's name, threads, CPU time and memory.
     SYS_KERNEL_STATS = 48, // (KernelStats* out): the kernel's own memory (heap, page tables, promises).
+
+    // Threads. A process has one thread to start with; they share its memory
+    // and handles. SYS_EXIT ends the whole process; SYS_THREAD_EXIT just the
+    // caller (the process, if it was the last). SYS_TASK_ID is the process's id.
+    SYS_THREAD_CREATE = 49,  // (entry, stackTop, u64 arg, u64 tlsBase) -> thread id. It starts at `entry` with
+                             //   `arg` in rdi, on the stack the caller made, with its FS base (thread-local
+                             //   storage) at tlsBase. NO_SPACE at the process's thread limit.
+    SYS_THREAD_EXIT = 50,    // (long code)
+    SYS_THREAD_ID = 51,      // () -> the calling thread's id
+    SYS_THREAD_JOIN = 52,    // (u64 thread, long* code, u64 timeoutMs): waits for a thread of the same process
+                             //   to end, then its exit code. NOT_FOUND if there's no such thread (or its
+                             //   code was already taken); TIMED_OUT.
+    SYS_THREAD_SET_TLS = 53, // (u64 base): the calling thread's FS base
+    SYS_FUTEX_WAIT = 54,     // (u32* address, u32 expected, u64 timeoutMs): sleeps while *address == expected,
+                             //   until futex_wake on the same word (any process sharing the memory).
+                             //   OK (woken), WOULD_BLOCK (it wasn't `expected`), TIMED_OUT.
+    SYS_FUTEX_WAKE = 55,     // (u32* address, u64 count) -> threads woken (oldest first)
+
+    // Processes, through process handles (spawn with SPAWN_HANDLE). RIGHT_READ
+    // waits and reads; RIGHT_WRITE signals and limits.
+    SYS_PROCESS_WAIT = 56,   // (Handle process, long* code, u64 timeoutMs): waits for it to end, then its
+                             //   exit code (>= 0 from the program; EXIT_* if the kernel ended it). TIMED_OUT.
+    SYS_PROCESS_SIGNAL = 57, // (Handle process, u64 signal, u64 flags): SIGNAL_KILL ends it at once;
+                             //   SIGNAL_TERMINATE asks it to end (an EVENT_TERMINATE on its event channel,
+                             //   or, without one, ends it); SIGNAL_INTERRUPT is only an event. SIGNAL_GROUP:
+                             //   every process in its group. An app may signal only apps.
+    SYS_PROCESS_LIMIT = 58,  // (Handle process or NO_HANDLE for itself, u64 limit, u64 value): lowers a limit
+                             //   (never raises): LIMIT_MEMORY (bytes), LIMIT_OBJECTS, LIMIT_THREADS,
+                             //   LIMIT_CPU_MS (CPU time; then it's ended, EXIT_CPU_LIMIT).
+    SYS_PROCESS_EVENTS = 59, // (Handle endpoint): where this process's events go (an Event message per
+                             //   event, to the endpoint's peer); NO_HANDLE stops them. The endpoint moves.
+    SYS_PROCESS_INFO = 60,   // (Handle process, ProcessInfo* out)
+};
+
+// SYS_SPAWN (5th argument) and SYS_SPAWN_IMAGE (2nd) flags.
+constexpr unsigned long SPAWN_HANDLE = 1;    // return a process handle instead of its id
+constexpr unsigned long SPAWN_NEW_GROUP = 2; // start a new process group (else the parent's)
+
+// Exit codes the kernel gives a process it ended.
+constexpr long EXIT_FAULT = -1;         // a thread faulted (page fault, invalid instruction...)
+constexpr long EXIT_KILLED = -2;        // SIGNAL_KILL, or SIGNAL_TERMINATE with no event channel
+constexpr long EXIT_CPU_LIMIT = -3;     // used up LIMIT_CPU_MS
+constexpr long EXIT_OUT_OF_MEMORY = -4; // ended to free memory (the app holding the most)
+
+constexpr unsigned long SIGNAL_KILL = 1, SIGNAL_TERMINATE = 2, SIGNAL_INTERRUPT = 3;
+constexpr unsigned long SIGNAL_GROUP = 1;
+constexpr unsigned long LIMIT_MEMORY = 1, LIMIT_OBJECTS = 2, LIMIT_THREADS = 3, LIMIT_CPU_MS = 4;
+
+// What arrives on a process's event channel (SYS_PROCESS_EVENTS). This is
+// Bhairav's equivalent of signals: events are messages the process reads
+// when it likes, never code run behind its back. Faults aren't events: a
+// faulting thread ends its process (EXIT_FAULT), and whoever holds a handle
+// to it reads what happened (ProcessInfo).
+struct Event {
+    unsigned long kind; // EVENT_*
+    unsigned long from; // the sender's process id
+};
+constexpr unsigned long EVENT_TERMINATE = 1, EVENT_INTERRUPT = 2;
+
+// SYS_PROCESS_INFO.
+struct ProcessInfo {
+    unsigned long id, group, parent;
+    unsigned long threads;    // live threads
+    long exitCode;            // once exited
+    unsigned char exited;
+    unsigned char reserved[7];
+    unsigned long cpuMs;
+    unsigned long faultVector;  // why it ended, when it faulted (EXIT_FAULT)
+    unsigned long faultAddress; // the address of a page fault
+    unsigned long faultRip;
 };
 
 // SYS_TASK_LIST: one task. Memory counts whole bytes.
@@ -165,8 +235,8 @@ struct TaskInfo {
     unsigned long id;
     char name[32];
     unsigned char privilege; // TASK_APP, TASK_SYSTEM, TASK_ROOT
-    unsigned char state;     // TASK_READY, TASK_RUNNING, TASK_WAITING
-    unsigned short reserved;
+    unsigned char state;     // TASK_READY, TASK_RUNNING, TASK_WAITING (its busiest thread)
+    unsigned short threads;
     unsigned int regions;    // memory regions it has mapped
     unsigned long cpuMs;
     unsigned long residentBytes;  // private memory it holds now

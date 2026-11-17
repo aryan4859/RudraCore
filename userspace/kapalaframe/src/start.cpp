@@ -1,4 +1,5 @@
 #include <kapala/sys.h>
+#include <kapala/thread.h>
 
 extern "C" int main();
 
@@ -18,6 +19,8 @@ void* __dso_handle = nullptr;
 }
 
 extern "C" [[noreturn]] void kapalaStart() {
+    // The main thread's thread-local storage, before anything may use it.
+    Kapala::Sys::threadSetTls(Kapala::Tls::create());
     for (auto* ctor = __init_array_start; ctor < __init_array_end; ctor++)
         (*ctor)();
     Kapala::Sys::exit(main());

@@ -5,8 +5,13 @@
 #include "arch/x86_64/fpu.h"
 #include "arch/x86_64/gdt.h"
 #include "arch/x86_64/idt.h"
+#include "core/channel.h"
+#include "core/device.h"
+#include "core/futex.h"
 #include "core/time.h"
+#include "core/vm.h"
 #include "log.h"
+#include "rudracore/syscalls.h"
 #include "mem/memory.h"
 #include "mem/pmm.h"
 #include "panic.h"
@@ -37,13 +42,15 @@ struct Queue {
 };
 Queue ready[2]; // 0: system, 1: apps
 
-Queue& queueOf(Task const* t) { return ready[t->privilege == Core::Privilege::App ? 1 : 0]; }
+Core::Privilege privilegeOf(Task const* t);
+Queue& queueOf(Task const* t) { return ready[privilegeOf(t) == Core::Privilege::App ? 1 : 0]; }
 Task* sleeping = nullptr;
 Task* zombies = nullptr;
 Task* everyTask = nullptr; // linked by allNext
 
 u64 nextId = 0;
 u64 liveTasks = 0;
+u64 loadedFsBase = 0; // what IA32_FS_BASE holds now
 u64 sliceStart = 0;
 
 void enqueue(Task* t) {
@@ -120,6 +127,8 @@ void unmapKernelStack(u64 top) {
     stackSlots[slot / 64] &= ~(1ull << (slot % 64));
 }
 
+// Frees a dead (or never started) thread. The last thread of a process
+// takes its resources with it: by then nothing runs in its address space.
 void destroy(Task* t) {
     for (Task** link = &everyTask; *link; link = &(*link)->allNext) {
         if (*link == t) {
@@ -127,12 +136,88 @@ void destroy(Task* t) {
             break;
         }
     }
-    t->releaseResources();
+    if (Core::Process* p = t->process) {
+        for (Task** link = &p->threads; *link; link = &(*link)->threadNext) {
+            if (*link == t) {
+                *link = t->threadNext;
+                break;
+            }
+        }
+        if (not p->threads)
+            p->releaseResources();
+        p->unref();
+    }
     if (t->stackPhysical) {
         unmapKernelStack(t->stackTop);
         Pmm::free(t->stackPhysical, STACK_PAGES);
     }
     delete t;
+}
+
+// Off the ready queues and the sleep list, wherever it is.
+void unqueue(Task* t) {
+    for (Queue& q : ready) {
+        Task* previous = nullptr;
+        for (Task* each = q.head; each; previous = each, each = each->next) {
+            if (each != t)
+                continue;
+            (previous ? previous->next : q.head) = t->next;
+            if (q.tail == t)
+                q.tail = previous;
+            break;
+        }
+    }
+    for (Task** link = &sleeping; *link; link = &(*link)->next) {
+        if (*link == t) {
+            *link = t->next;
+            break;
+        }
+    }
+}
+
+// A thread ends: nothing may keep pointing at it as a waiter, and its
+// process learns (join, and its exit when it's the last).
+void markDead(Task* t, i64 code) {
+    Vm::forgetWait(*t);
+    Futex::forget(t);
+    t->joinTarget = 0;
+    t->exitWaitTarget = nullptr;
+    if (Core::Process* p = t->process) {
+        for (auto& slot : p->handles) {
+            Core::Object* object = slot.cap.object;
+            if (object and object->type == Core::ObjectType::Channel and
+                static_cast<Core::Endpoint*>(object)->waiter == t)
+                static_cast<Core::Endpoint*>(object)->waiter = nullptr;
+            if (object and object->type == Core::ObjectType::Irq and static_cast<Core::Irq*>(object)->waiter == t)
+                static_cast<Core::Irq*>(object)->waiter = nullptr;
+        }
+    }
+    t->exitCode = code;
+    t->state = TaskState::Dead;
+    Proc::threadEnded(t, code);
+}
+
+// Every thread of `p` but the current one ends now, at once.
+void endOtherThreads(Core::Process* p, i64 code) {
+    if (not p->exited) {
+        p->exited = true; // (before its threads end: their codes don't become its code)
+        p->exitCode = code;
+        Proc::wakeExitWaiters(p);
+    }
+    for (Task* t = p->threads; t;) {
+        Task* next = t->threadNext;
+        if (t != currentTask and t->state != TaskState::Dead) {
+            unqueue(t);
+            markDead(t, code);
+            liveTasks--;
+            destroy(t); // (may free p's resources: it was the last)
+        }
+        t = next;
+    }
+}
+
+Core::Privilege privilegeOf(Task const* t) {
+    return t->process ? t->process->privilege : Core::Privilege::System;
 }
 
 // Dead tasks can't free their own kernel stack while running on it, so they
@@ -217,7 +302,6 @@ Task* spawnKernel(char const* name, void (*entry)(u64), u64 arg) {
     if (not t)
         return nullptr;
 
-    t->privilege = Core::Privilege::System;
     Arch::Frame* frame = initialFrame(t);
     frame->rip = reinterpret_cast<u64>(&kernelTaskStart);
     frame->rdi = reinterpret_cast<u64>(entry);
@@ -245,49 +329,24 @@ Task* spawnUser(char const* name, Vmm::Space* space, u64 entry, u64 stackTop,
 
 void startTask(Task* t) { start(t); }
 
+void setThreadBase(Task* t, u64 base) {
+    Arch::InterruptGuard guard;
+    t->fsBase = base;
+    if (t == currentTask) {
+        Arch::writeMsr(Arch::Msr::FS_BASE, base);
+        loadedFsBase = base;
+    }
+}
+
 void discard(Task* t) {
     Arch::InterruptGuard guard;
-    t->releaseResources();
-    if (t->stackPhysical) {
-        unmapKernelStack(t->stackTop);
-        Pmm::free(t->stackPhysical, STACK_PAGES);
-    }
-    delete t;
+    if (t->process)
+        t->process->liveThreads = 0;
+    destroy(t); // (its process goes with it: it was the only thread)
 }
 
-bool kill(Task* t, i64 code) {
-    Arch::InterruptGuard guard;
-    if (t == currentTask or t == idleTask or t->state == TaskState::Dead)
-        return false;
-    // Off whichever list holds it. (A Blocked task is held by objects: the
-    // ones it waits on through its handles forget it in releaseResources.)
-    for (Queue& q : ready) {
-        Task* previous = nullptr;
-        for (Task* each = q.head; each; previous = each, each = each->next) {
-            if (each != t)
-                continue;
-            (previous ? previous->next : q.head) = t->next;
-            if (q.tail == t)
-                q.tail = previous;
-            break;
-        }
-    }
-    for (Task** link = &sleeping; *link; link = &(*link)->next) {
-        if (*link == t) {
-            *link = t->next;
-            break;
-        }
-    }
-    t->exitCode = code;
-    t->state = TaskState::Dead;
-    liveTasks--;
-    log("[sched] ", t->name, " (task ", t->id, ") was ended, code ", code);
-    destroy(t);
-    return true;
-}
-
-Task* createUser(char const* name, Vmm::Space* space, u64 entry, u64 stackTop,
-                 Core::Capability const* handles, usize handleCount) {
+Task* createUser(char const* name, Vmm::Space* space, u64 entry, u64 stackTop, Core::Capability const* handles,
+                 usize handleCount, Core::Process* parent, bool newGroup) {
     Task* t = newTask(name);
     if (not t) {
         Vmm::destroyUserSpace(space);
@@ -298,11 +357,18 @@ Task* createUser(char const* name, Vmm::Space* space, u64 entry, u64 stackTop,
         return nullptr;
     }
 
-    t->space = space;
+    Core::Process* p = Proc::create(name, space, parent, newGroup);
+    p->id = t->id; // (a process's id is its first thread's)
+    if (not p->group)
+        p->group = p->id;
     // Half of RAM per program: shortcut, a fixed share; per-program limits set by init could come later.
-    t->quota = new Core::Quota(Pmm::stats().managedPages / 2);
-    for (usize i = 0; i < handleCount and i + 1 < Task::MAX_HANDLES; i++)
-        t->handles[i + 1].cap = handles[i];
+    p->quota = new Core::Quota(Pmm::stats().managedPages / 2);
+    for (usize i = 0; i < handleCount and i + 1 < Core::Process::MAX_HANDLES; i++)
+        p->handles[i + 1].cap = handles[i];
+    p->ref();
+    p->threads = t;
+    p->liveThreads = 1;
+    t->process = p;
 
     Arch::Frame* frame = initialFrame(t);
     frame->rip = entry;
@@ -310,6 +376,65 @@ Task* createUser(char const* name, Vmm::Space* space, u64 entry, u64 stackTop,
     frame->cs = Arch::Gdt::USER_CODE;
     frame->ss = Arch::Gdt::USER_DATA;
     return t;
+}
+
+Task* createThread(Core::Process* p, u64 entry, u64 stackTop, u64 arg, u64 fsBase) {
+    Arch::InterruptGuard guard;
+    if (p->exited or p->liveThreads >= p->threadLimit)
+        return nullptr;
+    Task* t = newTask(p->name);
+    if (not t)
+        return nullptr;
+    p->ref();
+    t->process = p;
+    t->threadNext = p->threads;
+    p->threads = t;
+    p->liveThreads++;
+    t->fsBase = fsBase;
+
+    Arch::Frame* frame = initialFrame(t);
+    frame->rip = entry;
+    frame->rsp = stackTop;
+    frame->rdi = arg;
+    frame->cs = Arch::Gdt::USER_CODE;
+    frame->ss = Arch::Gdt::USER_DATA;
+    start(t);
+    return t;
+}
+
+Arch::Frame* exitThread(Arch::Frame* frame, i64 code) {
+    if (currentTask == idleTask)
+        panic("sched: the idle task can't exit");
+    bool last = currentTask->process and currentTask->process->liveThreads == 1;
+    markDead(currentTask, code);
+    if (last)
+        log("[sched] ", currentTask->name, " (process ", currentTask->process->id, ") exited with code ",
+            currentTask->process->exitCode);
+    return switchFrom(frame);
+}
+
+Arch::Frame* exitProcess(Arch::Frame* frame, i64 code) {
+    if (currentTask == idleTask)
+        panic("sched: the idle task can't exit");
+    Core::Process* p = currentTask->process;
+    if (p) {
+        endOtherThreads(p, code);
+        log("[sched] ", p->name, " (process ", p->id, ") exited with code ", p->exitCode);
+    }
+    markDead(currentTask, code);
+    return switchFrom(frame);
+}
+
+void endProcess(Core::Process* p, i64 code) {
+    Arch::InterruptGuard guard;
+    if (currentTask->process == p)
+        panic("sched: endProcess on the current process (use exitProcess)");
+    if (p->exited and not p->liveThreads)
+        return;
+    p->ref(); // (its last thread may free it)
+    endOtherThreads(p, code);
+    log("[sched] ", p->name, " (process ", p->id, ") was ended, code ", p->exitCode);
+    p->unref();
 }
 
 Task* allTasks() {
@@ -391,9 +516,14 @@ Arch::Frame* switchFrom(Arch::Frame* frame) {
     Arch::Gdt::setKernelStack(next->stackTop);
     Arch::Fpu::restore(next->fpuState);
 
-    Vmm::Space const& space = next->space ? *next->space : Vmm::kernelSpace();
+    Vmm::Space const& space = next->process and next->process->space ? *next->process->space : Vmm::kernelSpace();
     if (Arch::readCr3() != space.root)
         space.activate();
+    // Thread-local storage: each thread's FS base.
+    if (next->fsBase != loadedFsBase) {
+        Arch::writeMsr(Arch::Msr::FS_BASE, next->fsBase);
+        loadedFsBase = next->fsBase;
+    }
 
     return reinterpret_cast<Arch::Frame*>(next->savedFrame);
 }
@@ -407,9 +537,16 @@ Arch::Frame* onTimerTick(Arch::Frame* frame) {
 
     if (currentTask != idleTask)
         currentTask->cpuMs++; // the 1 ms tick lands on whoever is running
+    if (Core::Process* p = currentTask->process) {
+        p->cpuMs++;
+        if (p->cpuLimitMs and p->cpuMs > p->cpuLimitMs and not p->exited) {
+            log("[sched] ", p->name, " (process ", p->id, ") used up its CPU time limit (", p->cpuLimitMs, " ms)");
+            return exitProcess(frame, Abi::EXIT_CPU_LIMIT);
+        }
+    }
     if (not ready[0].head and not ready[1].head)
         return frame;
-    bool appPreempted = currentTask->privilege == Core::Privilege::App and ready[0].head;
+    bool appPreempted = privilegeOf(currentTask) == Core::Privilege::App and ready[0].head;
     if (currentTask == idleTask or appPreempted or now - sliceStart >= TIME_SLICE_MS)
         return switchFrom(frame);
     return frame;
@@ -455,13 +592,5 @@ Arch::Frame* sleepCurrent(Arch::Frame* frame, u64 milliseconds) {
     return switchFrom(frame);
 }
 
-Arch::Frame* exitCurrent(Arch::Frame* frame, i64 code) {
-    if (currentTask == idleTask)
-        panic("sched: the idle task can't exit");
-    currentTask->exitCode = code;
-    currentTask->state = TaskState::Dead;
-    log("[sched] ", currentTask->name, " (task ", currentTask->id, ") exited with code ", code);
-    return switchFrom(frame);
-}
 
 } // namespace Rudracore::Sched

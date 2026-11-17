@@ -76,20 +76,21 @@ bool exists(char const* name, usize nameLength) {
 }
 
 Core::Task* startImage(char const* name, Core::SharedMemory* image, usize size, Core::Capability const* handles,
-                       usize handleCount, Abi::Error& code, char const*& error) {
+                       usize handleCount, Abi::Error& code, char const*& error, Core::Process* parent, bool newGroup) {
     Elf::Program program;
     if (not Elf::load(image, size, program, error)) {
         code = error == Elf::OUT_OF_MEMORY ? Abi::OUT_OF_MEMORY : Abi::INVALID_ARGUMENT;
         dropHandles(handles, handleCount);
         return nullptr;
     }
-    Core::Task* task = Sched::createUser(name, program.space, program.entry, program.stackTop, handles, handleCount);
+    Core::Task* task = Sched::createUser(name, program.space, program.entry, program.stackTop, handles, handleCount,
+                                        parent, newGroup);
     if (not task) {
         code = Abi::OUT_OF_MEMORY;
         error = "out of memory";
         return nullptr;
     }
-    if (not Elf::mapRegions(*task, image, size, program, error)) {
+    if (not Elf::mapRegions(*task->process, image, size, program, error)) {
         Sched::discard(task); // (drops the handles too)
         code = Abi::OUT_OF_MEMORY;
         return nullptr;
@@ -99,7 +100,7 @@ Core::Task* startImage(char const* name, Core::SharedMemory* image, usize size, 
 }
 
 Core::Task* start(char const* name, usize nameLength, Core::Capability const* handles,
-                  usize handleCount, Abi::Error& code, char const*& error) {
+                  usize handleCount, Abi::Error& code, char const*& error, Core::Process* parent, bool newGroup) {
     Boot::Module const* module = nullptr;
     for (usize i = 0; bootInfo and i < bootInfo->moduleCount; i++) {
         if (nameEquals(bootInfo->modules[i].name, name, nameLength)) {
@@ -114,7 +115,7 @@ Core::Task* start(char const* name, usize nameLength, Core::Capability const* ha
         dropHandles(handles, handleCount);
         return nullptr;
     }
-    return startImage(module->name, image, module->size, handles, handleCount, code, error);
+    return startImage(module->name, image, module->size, handles, handleCount, code, error, parent, newGroup);
 }
 
 } // namespace Rudracore::Programs

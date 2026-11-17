@@ -16,10 +16,14 @@
 namespace Rudracore::Arch::Acpi {
 
 struct Madt {
+    static constexpr u32 MAX_CPUS = 16;
+
     bool present;
     u64 localApic;  // physical address of the local APIC
     bool pcCompatible; // dual 8259 PICs too (PCAT_COMPAT)
     u32 cpus;       // enabled processors (local APIC and x2APIC entries)
+    u8 apicIds[MAX_CPUS]; // their local APIC ids (the first MAX_CPUS)
+    u32 apicIdCount;
     u32 ioApics;
     u64 ioApic;     // the first one's address
     u32 ioApicGsiBase;

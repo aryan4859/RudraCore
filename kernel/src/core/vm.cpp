@@ -13,6 +13,7 @@ extern "C" void* memcpy(void* dest, void const* src, usize n);
 
 namespace Rudracore::Vm {
 
+using Core::Process;
 using Core::SharedMemory;
 using Core::Task;
 
@@ -20,7 +21,7 @@ namespace {
 
 constexpr u64 PAGE = Mem::PAGE_SIZE;
 
-Task* waiters = nullptr; // tasks whose fault waits for a pager (linked by Map::waitNext)
+Task* waiters = nullptr; // threads whose fault waits for a pager (linked by Task::pageWaitNext)
 
 Region* find(Map& m, u64 address) {
     u32 lo = 0, hi = m.count;
@@ -90,7 +91,7 @@ void removeAt(Map& m, u32 index) {
     m.count--;
 }
 
-bool commit(Task& t, u64 pages) {
+bool commit(Process& t, u64 pages) {
     if (not pages)
         return true;
     if (not t.quota->charge(pages))
@@ -103,7 +104,7 @@ bool commit(Task& t, u64 pages) {
 }
 
 // What a region gave back: promises it never used, and its quota.
-void uncommit(Task& t, Region const& r) {
+void uncommit(Process& t, Region const& r) {
     Pmm::unpromise(r.committed - r.privatePages);
     if (t.quota)
         t.quota->refund(r.committed);
@@ -122,7 +123,7 @@ u32 access(Region const& r, bool privatePage) {
 
 // Maps a contiguous object's pages at once (device memory, buffers): no
 // faults for them later.
-bool mapEagerly(Task& t, Region const& r) {
+bool mapEagerly(Process& t, Region const& r) {
     SharedMemory* o = r.object;
     if (not t.space->map(r.start, o->physical + r.offset, r.size, access(r, false), o->cache)) {
         t.space->unmap(r.start, r.size);
@@ -133,7 +134,7 @@ bool mapEagerly(Task& t, Region const& r) {
 
 // Takes the region's pages out of the address space, frees its own, and
 // gives back what it held.
-void tearDown(Task& t, Region& r) {
+void tearDown(Process& t, Region& r) {
     if (r.kind == Kind::Shared) {
         t.space->unmap(r.start, r.size); // the object's pages: never the task's to free
     } else {
@@ -149,19 +150,23 @@ void tearDown(Task& t, Region& r) {
         r.object->unref();
 }
 
+} // namespace
+
 void forgetWait(Task& t) {
-    for (Task** link = &waiters; *link; link = &(*link)->vm.waitNext) {
+    for (Task** link = &waiters; *link; link = &(*link)->pageWaitNext) {
         if (*link == &t) {
-            *link = t.vm.waitNext;
+            *link = t.pageWaitNext;
             break;
         }
     }
-    t.vm.waitObject = nullptr;
-    t.vm.waitNext = nullptr;
+    t.pageWaitObject = nullptr;
+    t.pageWaitNext = nullptr;
 }
 
+namespace {
+
 // A page a paged object doesn't have: asked of its pager (once), and the
-// task waits for it.
+// thread waits for it.
 Fault request(Task& t, SharedMemory* o, u64 index) {
     Core::Endpoint* pagerEnd = o->pager ? o->pager->peer : nullptr;
     if (not pagerEnd)
@@ -177,15 +182,15 @@ Fault request(Task& t, SharedMemory* o, u64 index) {
         o->pages[index] = SharedMemory::REQUESTED;
     }
     forgetWait(t);
-    t.vm.waitObject = o;
-    t.vm.waitIndex = index;
-    t.vm.waitNext = waiters;
+    t.pageWaitObject = o;
+    t.pageWaitIndex = index;
+    t.pageWaitNext = waiters;
     waiters = &t;
     return Fault::Pending;
 }
 
 // A fresh private page at `page`: zeros, or a copy of `from`'s first `bytes`.
-Fault privatePage(Task& t, Region& r, u64 page, u64 from, u64 bytes) {
+Fault privatePage(Process& t, Region& r, u64 page, u64 from, u64 bytes) {
     u64 fresh = Pmm::allocPromised();
     if (not fresh)
         return Fault::OutOfMemory;
@@ -204,7 +209,7 @@ Fault privatePage(Task& t, Region& r, u64 page, u64 from, u64 bytes) {
 
 } // namespace
 
-i64 mapAnonymous(Task& t, u64 size, bool writable, u64 at, u64& address) {
+i64 mapAnonymous(Process& t, u64 size, bool writable, u64 at, u64& address) {
     size = Mem::alignUp(size, PAGE);
     if (size == 0 or size < PAGE)
         return Abi::INVALID_ARGUMENT;
@@ -227,7 +232,7 @@ i64 mapAnonymous(Task& t, u64 size, bool writable, u64 at, u64& address) {
     return Abi::OK;
 }
 
-i64 mapObject(Task& t, SharedMemory* o, Kind kind, u64 offset, u64 size, u64 visible, bool writable,
+i64 mapObject(Process& t, SharedMemory* o, Kind kind, u64 offset, u64 size, u64 visible, bool writable,
               bool executable, u64 at, u64& address) {
     size = Mem::alignUp(size, PAGE);
     if (size == 0 or (writable and executable) or offset % PAGE or offset > o->size)
@@ -268,7 +273,7 @@ i64 mapObject(Task& t, SharedMemory* o, Kind kind, u64 offset, u64 size, u64 vis
     return Abi::OK;
 }
 
-i64 unmap(Task& t, u64 address) {
+i64 unmap(Process& t, u64 address) {
     Region* r = find(t.vm, address);
     if (not r or r->start != address)
         return Abi::NOT_FOUND;
@@ -277,7 +282,7 @@ i64 unmap(Task& t, u64 address) {
     return Abi::OK;
 }
 
-i64 protect(Task& t, u64 address, bool writable) {
+i64 protect(Process& t, u64 address, bool writable) {
     Region* r = find(t.vm, address);
     if (not r or r->start != address)
         return Abi::NOT_FOUND;
@@ -307,9 +312,10 @@ i64 protect(Task& t, u64 address, bool writable) {
     return Abi::OK;
 }
 
-Fault fault(Task& t, u64 address, bool write, bool execute) {
-    if (not t.space or address >= Vmm::USER_END)
+Fault fault(Task& thread, u64 address, bool write, bool execute) {
+    if (not thread.process or not thread.process->space or address >= Vmm::USER_END)
         return Fault::Invalid;
+    Process& t = *thread.process;
     Region* r = find(t.vm, address);
     if (not r or (write and not r->writable) or (execute and not r->executable))
         return Fault::Invalid;
@@ -331,7 +337,7 @@ Fault fault(Task& t, u64 address, bool write, bool execute) {
         u64 objectIndex = r->offset / PAGE + index;
         u64 p = r->object->pageAt(objectIndex);
         if (not p)
-            return request(t, r->object, objectIndex);
+            return request(thread, r->object, objectIndex);
         if (not t.space->map(page, p, PAGE, access(*r, false), r->object->cache))
             return Fault::OutOfMemory;
         return Fault::Resolved;
@@ -344,7 +350,7 @@ Fault fault(Task& t, u64 address, bool write, bool execute) {
         u64 objectIndex = r->offset / PAGE + index;
         u64 p = r->object->pageAt(objectIndex);
         if (not p)
-            return request(t, r->object, objectIndex);
+            return request(thread, r->object, objectIndex);
         bool partial = byte + PAGE > r->visible;
         if (write or partial) // its own page: a copy (with zeros after the data, if partial)
             return privatePage(t, *r, page, p, partial ? r->visible - byte : PAGE);
@@ -356,26 +362,25 @@ Fault fault(Task& t, u64 address, bool write, bool execute) {
     return Fault::Invalid;
 }
 
-Fault prepare(Task& t, u64 address, u64 length, bool write) {
+Fault prepare(Task& thread, u64 address, u64 length, bool write) {
     u64 end = address + length;
-    if (end < address or end > Vmm::USER_END)
+    if (end < address or end > Vmm::USER_END or not thread.process)
         return Fault::Invalid;
     for (u64 page = Mem::alignDown(address, PAGE); page < end; page += PAGE) {
         u64 phys;
         bool writable;
-        if (t.space->query(page, phys, writable) and (not write or writable))
+        if (thread.process->space->query(page, phys, writable) and (not write or writable))
             continue; // (also pages mapped outside any region: an image loaded the old way)
-        Fault f = fault(t, page, write, false);
+        Fault f = fault(thread, page, write, false);
         if (f != Fault::Resolved)
             return f;
     }
     return Fault::Resolved;
 }
 
-void release(Task& t) {
+void release(Process& t) {
     // The space is gone already, with every page it owned: only accounting
     // and the objects' references are left.
-    forgetWait(t);
     for (u32 i = 0; i < t.vm.count; i++) {
         uncommit(t, t.vm.regions[i]);
         if (t.vm.regions[i].object)
@@ -385,8 +390,8 @@ void release(Task& t) {
     t.vm = {};
 }
 
-void revoke(SharedMemory* object, Task* except) {
-    for (Task* t = Sched::allTasks(); t; t = t->allNext) {
+void revoke(SharedMemory* object, Process* except) {
+    for (Process* t = Proc::all(); t; t = t->allNext) {
         if (t == except or not t->space)
             continue;
         for (u32 i = t->vm.count; i-- > 0;) {
@@ -400,7 +405,7 @@ void revoke(SharedMemory* object, Task* except) {
 
 void seal(SharedMemory* object) {
     object->sealed = true;
-    for (Task* t = Sched::allTasks(); t; t = t->allNext) {
+    for (Process* t = Proc::all(); t; t = t->allNext) {
         if (not t->space)
             continue;
         for (u32 i = 0; i < t->vm.count; i++) {
@@ -421,13 +426,13 @@ void supplied(SharedMemory* object, u64 index, u64 physical) {
     object->residentPages++;
     for (Task** link = &waiters; *link;) {
         Task* t = *link;
-        if (t->vm.waitObject == object and t->vm.waitIndex == index) {
-            *link = t->vm.waitNext;
-            t->vm.waitObject = nullptr;
-            t->vm.waitNext = nullptr;
+        if (t->pageWaitObject == object and t->pageWaitIndex == index) {
+            *link = t->pageWaitNext;
+            t->pageWaitObject = nullptr;
+            t->pageWaitNext = nullptr;
             Sched::wake(t);
         } else {
-            link = &t->vm.waitNext;
+            link = &t->pageWaitNext;
         }
     }
 }
@@ -439,13 +444,13 @@ void pagerGone(SharedMemory* object) {
     }
     for (Task** link = &waiters; *link;) {
         Task* t = *link;
-        if (t->vm.waitObject == object) {
-            *link = t->vm.waitNext;
-            t->vm.waitObject = nullptr;
-            t->vm.waitNext = nullptr;
+        if (t->pageWaitObject == object) {
+            *link = t->pageWaitNext;
+            t->pageWaitObject = nullptr;
+            t->pageWaitNext = nullptr;
             Sched::wake(t); // it faults again, and that fault is for good
         } else {
-            link = &t->vm.waitNext;
+            link = &t->pageWaitNext;
         }
     }
 }
@@ -460,7 +465,7 @@ u64 reclaim(u64 wanted) {
             if (p <= SharedMemory::REQUESTED)
                 continue;
             // Wherever it's mapped (as itself: a Copy region's own copies stay).
-            for (Task* t = Sched::allTasks(); t; t = t->allNext) {
+            for (Process* t = Proc::all(); t; t = t->allNext) {
                 for (u32 i = 0; t->space and i < t->vm.count; i++) {
                     Region const& r = t->vm.regions[i];
                     u64 first = r.offset / PAGE;
@@ -483,7 +488,7 @@ u64 reclaim(u64 wanted) {
     return freed;
 }
 
-Usage usage(Task const& t) {
+Usage usage(Process const& t) {
     Usage u{};
     for (u32 i = 0; i < t.vm.count; i++) {
         Region const& r = t.vm.regions[i];
@@ -496,11 +501,11 @@ Usage usage(Task const& t) {
     return u;
 }
 
-Task* outOfMemory(Task* current) {
-    Task* victim = nullptr;
+Process* outOfMemory(Process* current) {
+    Process* victim = nullptr;
     u64 most = 0;
-    for (Task* t = Sched::allTasks(); t; t = t->allNext) {
-        if (t->privilege != Core::Privilege::App or t->state == Core::TaskState::Dead or not t->space)
+    for (Process* t = Proc::all(); t; t = t->allNext) {
+        if (t->privilege != Core::Privilege::App or t->exited or not t->space)
             continue;
         Usage u = usage(*t);
         if (not victim or u.committed + u.resident > most) {
@@ -510,10 +515,10 @@ Task* outOfMemory(Task* current) {
     }
     if (not victim)
         return nullptr;
-    log("[vm]   out of memory: ending ", victim->name, " (task ", victim->id, ", the app holding the most: ",
+    log("[vm]   out of memory: ending ", victim->name, " (process ", victim->id, ", the app holding the most: ",
         Bytes{most * PAGE}, ")");
     if (victim != current)
-        Sched::kill(victim, -1);
+        Sched::endProcess(victim, Abi::EXIT_OUT_OF_MEMORY);
     return victim;
 }
 

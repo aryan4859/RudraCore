@@ -9,6 +9,7 @@ PHDRS
     text PT_LOAD FLAGS(5);   /* r-x */
     rodata PT_LOAD FLAGS(4); /* r-- */
     data PT_LOAD FLAGS(6);   /* rw- */
+    tls PT_TLS FLAGS(4);     /* thread_local: the template (.tdata copied, .tbss zeroed per thread) */
 }
 
 SECTIONS
@@ -30,6 +31,21 @@ SECTIONS
     .data : {
         *(.data .data.*)
     } :data
+
+    /* Thread-local storage. Kapala::Tls::create builds each thread's block
+       from these (the linker's offsets assume variant II, block size rounded
+       up to the alignment). */
+    .tdata : {
+        *(.tdata .tdata.*)
+    } :data :tls
+    .tbss : {
+        *(.tbss .tbss.*)
+        *(.tcommon)
+    } :data :tls
+    __tls_template = ADDR(.tdata);
+    __tls_file_size = SIZEOF(.tdata);
+    __tls_memory_size = ADDR(.tbss) + SIZEOF(.tbss) - ADDR(.tdata);
+    __tls_align = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss));
 
     .init_array : {
         __init_array_start = .;

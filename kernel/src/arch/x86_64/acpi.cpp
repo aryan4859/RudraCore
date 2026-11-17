@@ -62,10 +62,15 @@ void parseMadt(u8 const* t, u32 length) {
         if (size < 2 or at + size > length)
             break;
         u8 const* e = t + at;
-        if (type == 0 and size >= 8 and (get32(e + 4) & 1))
+        if (type == 0 and size >= 8 and (get32(e + 4) & 1)) {
             m.cpus++;
-        else if (type == 9 and size >= 16 and (get32(e + 8) & 1))
+            if (m.apicIdCount < Madt::MAX_CPUS)
+                m.apicIds[m.apicIdCount++] = e[3];
+        } else if (type == 9 and size >= 16 and (get32(e + 8) & 1)) {
             m.cpus++;
+            if (get32(e + 4) < 0xFF and m.apicIdCount < Madt::MAX_CPUS) // (xAPIC mode reaches ids below 255)
+                m.apicIds[m.apicIdCount++] = static_cast<u8>(get32(e + 4));
+        }
         else if (type == 1 and size >= 12) {
             if (m.ioApics++ == 0) {
                 m.ioApic = get32(e + 4);

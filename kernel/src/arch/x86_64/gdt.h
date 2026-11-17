@@ -16,9 +16,15 @@ constexpr u16 TSS = 0x28;
 // overflow still reaches the panic screen instead of triple-faulting.
 constexpr u8 IST_DOUBLE_FAULT = 1;
 
+constexpr u32 MAX_CPUS = 16;
+
+// Builds the GDT (a TSS per CPU) and loads it on the boot CPU.
 void init();
 
-// Stack the CPU switches to when an interrupt arrives from user mode.
+// Loads the GDT and CPU `cpu`'s TSS on the CPU running this.
+void load(u32 cpu);
+
+// Stack this CPU switches to when an interrupt arrives from user mode.
 void setKernelStack(u64 top);
 
 } // namespace Rudracore::Arch::Gdt

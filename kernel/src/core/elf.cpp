@@ -198,7 +198,7 @@ bool segmentsSharePages(ProgramHeader const* headers, u16 count) {
 
 } // namespace
 
-bool mapRegions(Core::Task& task, Core::SharedMemory* image, usize size, Program const& program, char const*& error) {
+bool mapRegions(Core::Process& task, Core::SharedMemory* image, usize size, Program const& program, char const*& error) {
     (void)size;
     u8 const* data = Mem::toVirtual<u8>(image->physical);
     auto const* header = reinterpret_cast<Header const*>(data);

@@ -13,8 +13,10 @@ void init(Boot::Info const& info);
 // Loads and starts the program called `name`, giving it `handles` (the
 // references move to the new task, even on failure). Returns the task, or
 // nullptr with `code` and a readable `error` set.
+// It belongs to `parent`'s process group, or a new one.
 Core::Task* start(char const* name, usize nameLength, Core::Capability const* handles,
-                  usize handleCount, Abi::Error& code, char const*& error);
+                  usize handleCount, Abi::Error& code, char const*& error, Core::Process* parent = nullptr,
+                  bool newGroup = false);
 
 // Whether the boot image has a program called `name`.
 bool exists(char const* name, usize nameLength);
@@ -23,7 +25,8 @@ bool exists(char const* name, usize nameLength);
 // be sealed (nothing may change it under the program); the task keeps its
 // own references to it. `name` is only its task's name.
 Core::Task* startImage(char const* name, Core::SharedMemory* image, usize size, Core::Capability const* handles,
-                       usize handleCount, Abi::Error& code, char const*& error);
+                       usize handleCount, Abi::Error& code, char const*& error, Core::Process* parent = nullptr,
+                       bool newGroup = false);
 
 // A data file from the boot image as read-only shared memory (made on first
 // use and kept), or nullptr.

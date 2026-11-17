@@ -33,8 +33,29 @@ bool enable();
 
 bool active();
 
-// This CPU's local APIC id (where interrupt messages go). While active.
+// This CPU's local APIC id (where interrupt messages go).
 u8 localId();
+
+// The local APIC of the CPU running this, software-enabled (the boot CPU
+// keeps its LINT0 for the 8259s). False without a MADT.
+bool initLocal(bool boot);
+
+// Interprocessor interrupts, and starting another CPU (INIT, then STARTUP
+// at physical page `page` << 12).
+void sendIpi(u8 destination, u8 vector);
+void sendInit(u8 destination);
+void sendStartup(u8 destination, u8 page);
+// End of an interrupt the local APIC raised itself (IPIs, its timer).
+void localEndOfInterrupt();
+
+// The local APIC timer: its rate (ticks per ms, measured with the TSC),
+// and periodic interrupts at `vector`, one per millisecond.
+u32 measureTimer(u64 tscHz);
+void startTimer(u32 ticksPerMs, u8 vector);
+
+// Interrupt distribution: CPUs that take device interrupts, in turn.
+void addDestination(u8 apicId);
+u8 nextDestination();
 
 // While active: the PIC functions (Pic::mask, unmask, endOfInterrupt) come here.
 void mask(u8 line);
