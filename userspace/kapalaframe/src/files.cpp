@@ -141,4 +141,30 @@ long Files::makeDir(char const* path) {
     return call(Fs::Op::MakeDir, path, 0, 0, 0, reply);
 }
 
+void* Files::map(char const* path, unsigned long& size, bool copy, long* error) {
+    long status = Sys::NOT_FOUND;
+    void* address = nullptr;
+    Fs::Request request{};
+    request.op = Fs::Op::Map;
+    unsigned long n = 0;
+    for (; path[n] and n + 1 < Fs::MAX_PATH; n++)
+        request.path[n] = path[n];
+    Fs::Reply reply{};
+    Sys::Handle memory = Sys::NO_HANDLE;
+    if (not _buffer or path[n])
+        status = path[n] ? Sys::INVALID_ARGUMENT : Sys::NOT_FOUND;
+    else if ((status = _channel.send(request)) == Sys::OK and (status = _channel.recv(reply, &memory)) == Sys::OK)
+        status = reply.status;
+    if (status == Sys::OK and memory) {
+        address = Sys::memoryMap(memory, copy ? Sys::MAP_COPY : 0);
+        status = address ? Sys::OK : Sys::OUT_OF_MEMORY;
+    }
+    if (memory)
+        Sys::close(memory); // (the mapping keeps it)
+    size = address ? reply.size : 0;
+    if (error)
+        *error = status;
+    return address;
+}
+
 } // namespace Kapala

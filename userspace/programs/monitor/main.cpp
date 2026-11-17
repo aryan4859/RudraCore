@@ -1,4 +1,5 @@
-// System Monitor: time, uptime, tasks and memory, refreshed every second.
+// System Monitor: time, uptime, memory, the kernel's own memory, and every
+// task's memory and CPU time, refreshed every second.
 
 #include <kapala/sys.h>
 #include <kapala/text.h>
@@ -9,9 +10,11 @@ using namespace Kapala::Gfx;
 
 namespace {
 
-constexpr int WIDTH = 480;
-constexpr int HEIGHT = 340;
+constexpr int WIDTH = 520;
+constexpr int HEIGHT = 560;
 constexpr int HISTORY = 60; // seconds of memory history
+constexpr int MAX_TASKS = 64;
+constexpr int SHOWN_TASKS = 10; // the ones holding the most memory
 
 void addTwoDigits(Text<64>& t, unsigned long v) {
     if (v < 10)
@@ -49,8 +52,21 @@ public:
     }
 
 private:
+    static unsigned long held(Sys::TaskInfo const& t) { return t.residentBytes; }
+
     void sample() {
         Sys::systemInfo(_info);
+        Sys::kernelStats(_kernel);
+        long n = Sys::taskList(_tasks, MAX_TASKS);
+        _taskCount = n < 0 ? 0 : n > MAX_TASKS ? MAX_TASKS : static_cast<int>(n);
+        // Most memory first (a few dozen tasks: insertion sort).
+        for (int i = 1; i < _taskCount; i++) {
+            Sys::TaskInfo t = _tasks[i];
+            int j = i;
+            for (; j > 0 and held(_tasks[j - 1]) < held(t); j--)
+                _tasks[j] = _tasks[j - 1];
+            _tasks[j] = t;
+        }
         unsigned long used = _info.totalMemory - _info.freeMemory;
         for (int i = 0; i + 1 < HISTORY; i++)
             _history[i] = _history[i + 1];
@@ -91,9 +107,40 @@ private:
             .add(" MiB free of ").add(_info.totalMemory / MIB).add(" MiB");
         c.text({24, 132}, memory.cstr(), Theme::TEXT);
 
+        constexpr unsigned long KIB = 1024;
+        Text<120> kernel;
+        kernel.add("kernel: heap ").add(_kernel.heapBytes / KIB).add(" KiB (peak ").add(_kernel.heapPeakBytes / KIB)
+            .add("), page tables ").add(_kernel.pageTablePages * 4).add(" KiB, files ")
+            .add(_kernel.fileBytes / KIB).add(" KiB");
+        c.text({24, 156}, kernel.cstr(), Theme::TEXT_DIM);
+
+        // Tasks: the ones holding the most memory. "in use" is what it holds
+        // now; "reserved" what it may still touch (taken only when touched).
+        int y = 186;
+        c.text({24, y}, "task", Theme::TEXT_DIM);
+        c.text({220, y}, "in use", Theme::TEXT_DIM);
+        c.text({310, y}, "reserved", Theme::TEXT_DIM);
+        c.text({410, y}, "cpu", Theme::TEXT_DIM);
+        for (int i = 0; i < _taskCount and i < SHOWN_TASKS; i++) {
+            Sys::TaskInfo const& t = _tasks[i];
+            y += 20;
+            Text<48> name;
+            name.add(t.name).add(t.privilege == Sys::TASK_APP ? "" : " *");
+            Text<24> inUse, reserved, cpu;
+            inUse.add(t.residentBytes / KIB).add(" KiB");
+            reserved.add(t.committedBytes / KIB).add(" KiB");
+            cpu.add(t.cpuMs / 1000).add(".").add(t.cpuMs / 100 % 10).add(" s");
+            Color color = t.state == Sys::TASK_RUNNING ? Theme::SAFFRON : Theme::TEXT;
+            c.text({24, y}, name.cstr(), color);
+            c.text({220, y}, inUse.cstr(), Theme::TEXT);
+            c.text({310, y}, reserved.cstr(), Theme::TEXT_DIM);
+            c.text({410, y}, cpu.cstr(), Theme::TEXT_DIM);
+        }
+        c.text({24, y + 22}, "* system service", Theme::TEXT_DIM);
+
         // History graph: one bar per second. The top of the graph is 25%
         // above the busiest moment, so steady use doesn't look like "full".
-        Rect graph{24, 168, WIDTH - 48, HEIGHT - 168 - 40};
+        Rect graph{24, y + 52, WIDTH - 48, HEIGHT - (y + 52) - 40};
         c.fillRounded(graph, 10, Theme::SURFACE_ALT);
         unsigned long peak = 1;
         for (int i = HISTORY - _samples; i < HISTORY; i++)
@@ -117,6 +164,9 @@ private:
 
     Window _window;
     Sys::SystemInfo _info{};
+    Sys::KernelStats _kernel{};
+    Sys::TaskInfo _tasks[MAX_TASKS] = {};
+    int _taskCount = 0;
     unsigned long _history[HISTORY] = {};
     int _samples = 0;
 };

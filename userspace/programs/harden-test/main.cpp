@@ -372,6 +372,78 @@ void checkPadding() {
     expect("system_info padding is zeroed", clean ? 0 : -1, 0);
 }
 
+// MARK: Virtual memory
+
+unsigned long freeMemory() {
+    Sys::SystemInfo info{};
+    Sys::systemInfo(info);
+    return info.freeMemory;
+}
+
+void checkMemory() {
+    // Demand paging: reserved memory takes no RAM until it's touched.
+    constexpr unsigned long BIG = 8ul << 20;
+    unsigned long before = freeMemory();
+    auto* big = static_cast<unsigned char*>(Sys::memoryAlloc(BIG));
+    unsigned long after = freeMemory();
+    expect("8 MiB of private memory", big ? 0 : -1, 0);
+    expect("untouched memory takes no RAM", before - after < (2ul << 20) ? 0 : -1, 0);
+    if (big) {
+        big[0] = 1;
+        big[BIG - 1] = 2; // the last page: its own, zero-filled until now
+        expect("touched pages are zeroed and kept", big[1] == 0 and big[0] == 1 and big[BIG - 1] == 2 ? 0 : -1, 0);
+        // Freed when unmapped, and the address comes back for the next one.
+        expect("unmapping private memory", Sys::memoryUnmap(big), 0);
+        auto* again = Sys::memoryAlloc(BIG);
+        expect("its addresses are reused", again == big ? 0 : -1, 0);
+        expect("and it's zero again", again and static_cast<unsigned char*>(again)[0] == 0 ? 0 : -1, 0);
+        Sys::memoryUnmap(again);
+    }
+
+    // Read-only regions: the kernel won't write into them for us either.
+    auto* page = static_cast<unsigned char*>(Sys::memoryAlloc(4096));
+    expect("making memory read-only", Sys::memoryProtect(page, false), 0);
+    expect("read-only memory refuses writes", Sys::random(page, 8), Sys::BAD_ADDRESS);
+    expect("making it writable again", Sys::memoryProtect(page, true), 0);
+    expect("writable again", Sys::random(page, 8), 0);
+    Sys::memoryUnmap(page);
+
+    // Copy-on-write: a MAP_COPY view sees the object until it writes; then
+    // its pages are its own.
+    auto mem = static_cast<Sys::Handle>(Sys::memoryCreate(4096));
+    auto* shared = static_cast<unsigned char*>(Sys::memoryMap(mem));
+    auto* copy = static_cast<unsigned char*>(Sys::memoryMap(mem, Sys::MAP_COPY));
+    if (shared and copy) {
+        shared[0] = 'A';
+        bool seesObject = copy[0] == 'A';
+        copy[0] = 'B';
+        shared[1] = 'C';
+        expect("a copy-on-write view", seesObject and shared[0] == 'A' and copy[0] == 'B' and copy[1] == 0 ? 0 : -1,
+               0);
+    } else {
+        expect("mapping a copy-on-write view", -1, 0);
+    }
+    Sys::memoryUnmap(copy);
+
+    // Sealing: nobody can change it anymore (so a receiver can check it once).
+    long weak = Sys::duplicate(mem, Sys::RIGHT_READ | Sys::RIGHT_WRITE);
+    expect("sealing needs RIGHT_REVOKE", Sys::memorySeal(static_cast<Sys::Handle>(weak)), Sys::ACCESS_DENIED);
+    expect("sealing", Sys::memorySeal(mem), 0);
+    Sys::MemoryInfo info{};
+    Sys::memoryInfo(mem, info);
+    expect("a sealed object says so", (info.flags & Sys::MEMORY_SEALED) ? 0 : -1, 0);
+    expect("its writable mapping became read-only", Sys::random(shared, 8), Sys::BAD_ADDRESS);
+    auto* sealedCopy = static_cast<unsigned char*>(Sys::memoryMap(mem, Sys::MAP_COPY));
+    expect("a sealed object can still be copied", sealedCopy and Sys::random(sealedCopy, 8) == 0 ? 0 : -1, 0);
+    Sys::memoryUnmap(sealedCopy);
+    Sys::memoryUnmap(shared);
+    Sys::close(static_cast<Sys::Handle>(weak));
+    Sys::close(mem);
+
+    expect("unmapping something that isn't mapped", Sys::memoryUnmap(reinterpret_cast<void*>(0x12345000)),
+           Sys::NOT_FOUND);
+}
+
 } // namespace
 
 int main() {
@@ -379,6 +451,7 @@ int main() {
     checkPrograms();
     checkPadding();
     checkCapabilities();
+    checkMemory();
     Sys::log("harden check: this text\n[init] must not start a second log line");
 
     Text<> line;

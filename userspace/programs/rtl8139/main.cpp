@@ -115,7 +115,7 @@ private:
     u32 volatile& reg32(u32 r) { return *reinterpret_cast<u32 volatile*>(_regs + r); }
 
     static u8* dma(Sys::Handle device, u64 size, u64& physical) {
-        long memory = Sys::memoryCreate(size);
+        long memory = Sys::memoryCreate(size, Sys::MEMORY_BELOW_4G); // (its DMA addresses are 32 bits)
         if (memory < 0)
             return nullptr;
         void* address = Sys::memoryMap(memory);

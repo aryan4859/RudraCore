@@ -157,6 +157,30 @@ int main() {
         same = bigBack[i] == big[i];
     check(same, "read the big file back", r);
 
+    // Memory-mapped: the same bytes, read from the disk page by page as
+    // they're touched (the fs server is the pager).
+    unsigned long mappedSize = 0;
+    long mapError = 0;
+    auto* view = static_cast<unsigned char const*>(files.map(BIG_FILE, mappedSize, false, &mapError));
+    same = view and mappedSize == BIG_SIZE;
+    for (unsigned long i = 0; same and i < BIG_SIZE; i++)
+        same = view[i] == big[i];
+    check(same, "memory-map the big file", mapError);
+    // A copy-on-write view: writes stay in it; the file and other views don't change.
+    auto* copy = static_cast<unsigned char*>(files.map(BIG_FILE, mappedSize, true));
+    if (copy) {
+        copy[0] ^= 0xFF;
+        copy[BIG_SIZE - 1] ^= 0xFF;
+    }
+    unsigned char first = 0;
+    check(copy and view and copy[0] == (big[0] ^ 0xFF) and copy[1] == big[1] and view[0] == big[0] and
+              files.read(BIG_FILE, &first, 1) == 1 and first == big[0],
+          "a copy-on-write view of a file");
+    if (view)
+        Sys::memoryUnmap(view);
+    if (copy)
+        Sys::memoryUnmap(copy);
+
     // Overwriting with something shorter replaces the whole file.
     r = files.write(BIG_FILE, "short", 5);
     check(r == 5 and files.stat(BIG_FILE, info) == Sys::OK and info.size == 5, "replace a file");
@@ -184,7 +208,8 @@ int main() {
 
     if (ok) {
         Text<> text;
-        text.add("fs check: create, read, append, long names, directories, remove and scopes ok; 150 KiB written in ")
+        text.add("fs check: create, read, append, long names, directories, remove, scopes and memory-mapped files ok; "
+                 "150 KiB written in ")
             .add(writeMs).add(" ms, read in ").add(readMs).add(" ms");
         Sys::log(text.cstr());
     }

@@ -1,6 +1,7 @@
 #include "core/channel.h"
 
 #include "core/sched.h"
+#include "core/vm.h"
 
 namespace Rudracore::Core {
 
@@ -14,6 +15,8 @@ Endpoint::~Endpoint() {
     if (peer) {
         peer->peer = nullptr;
         peer->wakeWaiter(); // let a blocked receiver see PEER_CLOSED
+        if (peer->pagerOf)
+            Vm::pagerGone(peer->pagerOf); // the pager went away: its pages can't come
     }
 }
 

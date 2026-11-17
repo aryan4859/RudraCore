@@ -16,6 +16,11 @@ u64 managedPages = 0;
 u64 freePages = 0;
 u64 bitmapBytes = 0;
 u64 searchHint = 0; // next-fit: resume searching after the last allocation
+u64 promised = 0;   // pages promised to programs, not yet allocated
+Reclaimer reclaimer = nullptr;
+bool reclaiming = false;
+constexpr u64 KERNEL_RESERVE_PAGES = 1024; // 4 MiB programs can't touch
+u64 lowWater() { return KERNEL_RESERVE_PAGES + managedPages / 64; } // reserve + ~1.5%
 
 bool isUsed(u64 page) {
     return (bitmap[page / 64] >> (page % 64)) & 1;
@@ -100,19 +105,23 @@ void init(Boot::Info const& info) {
     setUsed(0); // physical address 0 means "allocation failed"
 }
 
-u64 alloc(usize count) {
+u64 alloc(usize count, u64 below) {
     Arch::InterruptGuard guard;
     if (count == 0 or count > freePages)
         return 0;
 
+    u64 limit = below ? min(pageCount, below / Mem::PAGE_SIZE) : pageCount;
+    if (limit == 0)
+        return 0;
+    u64 hint = searchHint < limit ? searchHint : 0;
     u64 run = 0, runStart = 0;
-    for (u64 n = 0; n < pageCount; n++) {
-        u64 page = (searchHint + n) % pageCount;
+    for (u64 n = 0; n < limit; n++) {
+        u64 page = (hint + n) % limit;
         if (page == 0)
             run = 0; // a run can't wrap around the end of memory
 
         // Skip fully used 64-page blocks quickly.
-        if (run == 0 and page % 64 == 0 and bitmap[page / 64] == ~0ull and page + 64 <= pageCount) {
+        if (run == 0 and page % 64 == 0 and bitmap[page / 64] == ~0ull and page + 64 <= limit) {
             n += 63;
             continue;
         }
@@ -134,8 +143,8 @@ u64 alloc(usize count) {
     return 0;
 }
 
-u64 allocZeroed(usize count) {
-    u64 physical = alloc(count);
+u64 allocZeroed(usize count, u64 below) {
+    u64 physical = alloc(count, below);
     if (physical)
         memset(Mem::toVirtual(physical), 0, count * Mem::PAGE_SIZE);
     return physical;
@@ -166,17 +175,69 @@ void reclaimBootloaderMemory(Boot::Info const& info) {
 }
 
 Stats stats() {
+    Arch::InterruptGuard guard;
     return {
         .managedPages = managedPages,
         .freePages = freePages,
         .bitmapBytes = bitmapBytes,
+        .promisedPages = promised,
+        .lowWater = lowWater(),
     };
 }
 
-bool userCanUse(u64 pages) {
-    constexpr u64 KERNEL_RESERVE_PAGES = 1024; // 4 MiB
+u64 available() {
     Arch::InterruptGuard guard;
-    return freePages >= KERNEL_RESERVE_PAGES and pages <= freePages - KERNEL_RESERVE_PAGES;
+    return freePages > promised ? freePages - promised : 0;
+}
+
+void setReclaimer(Reclaimer r) { reclaimer = r; }
+
+void relievePressure(u64 pages) {
+    Arch::InterruptGuard guard;
+    if (reclaiming or not reclaimer)
+        return;
+    u64 want = lowWater() + pages;
+    if (available() >= want)
+        return;
+    reclaiming = true; // (reclaiming frees pages: no recursion)
+    reclaimer(want - available());
+    reclaiming = false;
+}
+
+bool userCanUse(u64 pages) {
+    relievePressure(pages);
+    Arch::InterruptGuard guard;
+    u64 left = available();
+    return left >= KERNEL_RESERVE_PAGES and pages <= left - KERNEL_RESERVE_PAGES;
+}
+
+bool promise(u64 pages) {
+    Arch::InterruptGuard guard;
+    if (not userCanUse(pages))
+        return false;
+    promised += pages;
+    return true;
+}
+
+void unpromise(u64 pages) {
+    Arch::InterruptGuard guard;
+    if (pages > promised)
+        panic("pmm: more pages unpromised than promised");
+    promised -= pages;
+}
+
+void freePromised(u64 page) {
+    Arch::InterruptGuard guard;
+    free(page);
+    promised++;
+}
+
+u64 allocPromised() {
+    Arch::InterruptGuard guard;
+    u64 page = allocZeroed();
+    if (page and promised)
+        promised--;
+    return page;
 }
 
 } // namespace Rudracore::Pmm

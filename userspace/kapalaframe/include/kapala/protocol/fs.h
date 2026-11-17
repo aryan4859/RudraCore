@@ -33,6 +33,13 @@
 //                                                 <- Reply{entries returned, total entries}
 //   Stat{path}                                    <- Reply{size, directory}
 //   Remove{path}  MakeDir{path}                   <- Reply
+//   Map{path}                                     <- Reply{file size} + a read-only memory handle:
+//                                                    the file, memory-mapped. Its pages are read
+//                                                    from the disk as they're first touched (the
+//                                                    server is their pager). Pages already read
+//                                                    stay as they were; once the file is written
+//                                                    or removed, touching one not yet read ends
+//                                                    the program (like a truncated file elsewhere).
 //
 // Paths are absolute ("/notes/today.txt") and case-insensitive.
 // Writes reach the disk before the reply.
@@ -51,6 +58,7 @@ enum class Op : unsigned char {
     Stat = 5,
     Remove = 6,
     MakeDir = 7,
+    Map = 8,
 };
 
 enum Flags : unsigned char {

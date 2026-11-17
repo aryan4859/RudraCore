@@ -20,6 +20,7 @@
 #include "core/shared_memory.h"
 #include "core/syscall.h"
 #include "core/time.h"
+#include "core/vm.h"
 #include "display.h"
 #include "log.h"
 #include "mem/heap.h"
@@ -163,6 +164,8 @@ void testHeap() {
 
     if (Heap::stats().bytesInUse != before)
         panic("selftest: heap accounting is off");
+    if (not Heap::check())
+        panic("selftest: a heap free list is damaged");
     log("[heap] small and multi-page allocations ok");
 }
 
@@ -438,11 +441,14 @@ extern "C" [[noreturn]] void kmain(u64 bootMagic, u64 bootInfo) {
             log("[rand] no healthy entropy source: programs get no random numbers (TLS fails closed)");
     }
     Sched::init();
+    Pmm::setReclaimer(Vm::reclaim); // memory pressure: file pages go first
     Programs::init(info);
     Syscall::init(info);
     Sched::spawnKernel("clock", clockTask, 0);
     startInit(info);
     faultTest();
+    if (info.diagnostic)
+        Heap::report();
 
     log("[sched] starting: 1 ms timer, 10 ms time slices");
     log("");

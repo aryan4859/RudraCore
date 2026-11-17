@@ -44,6 +44,13 @@ public:
     long remove(char const* path);
     long makeDir(char const* path);
 
+    // The file, memory-mapped: its pages are read from the disk as they're
+    // first touched. Read-only, or with `copy` a private copy-on-write view
+    // the program may write (the file doesn't change). Returns its address
+    // (`size` gets the file's size), or nullptr (`error` says why). Unmap
+    // with Sys::memoryUnmap.
+    void* map(char const* path, unsigned long& size, bool copy = false, long* error = nullptr);
+
 private:
     long call(Protocol::Fs::Op op, char const* path, unsigned long offset, unsigned long length,
               unsigned char flags, Protocol::Fs::Reply& reply);

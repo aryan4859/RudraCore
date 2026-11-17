@@ -3,6 +3,7 @@
 #include "arch/x86_64/frame.h"
 #include "core/object.h"
 #include "core/quota.h"
+#include "core/vm.h"
 #include "mem/vmm.h"
 
 namespace Rudracore::Core {
@@ -13,13 +14,6 @@ enum class TaskState : u8 {
     Sleeping,
     Blocked, // waiting on an object (channel, irq); the object holds the task
     Dead,
-};
-
-// Shared memory mapped into a task's address space.
-struct Mapping {
-    Object* object = nullptr; // holds a reference
-    u64 address = 0;
-    u64 size = 0;
 };
 
 // Who a task is, which bounds what it may hold and do:
@@ -36,8 +30,6 @@ enum class Privilege : u8 {
 
 struct Task {
     static constexpr usize MAX_HANDLES = 64;
-    static constexpr usize MAX_MAPPINGS = 32;
-    static constexpr u64 MAP_BASE = 0x100000000; // shared memory goes from 4 GiB up
 
     u64 id = 0;
     char name[32] = {};
@@ -73,8 +65,7 @@ struct Task {
         u64 generation = 0;
     };
     HandleSlot handles[MAX_HANDLES] = {}; // slot 0 is never used
-    Mapping mappings[MAX_MAPPINGS] = {};
-    u64 nextMapAddress = MAP_BASE;
+    Vm::Map vm; // its address space's regions (user tasks)
 
     bool isUser() const { return space != nullptr; }
 
@@ -113,6 +104,19 @@ Core::Task* spawnKernel(char const* name, void (*entry)(u64), u64 arg);
 // become the task's handles 1, 2, 3... (nullptr entries leave a gap).
 Core::Task* spawnUser(char const* name, Vmm::Space* space, u64 entry, u64 stackTop,
                       Core::Capability const* handles = nullptr, usize handleCount = 0);
+
+// The same in two steps: the task exists (so regions can be added to its
+// address space) but doesn't run until startTask, or is thrown away with
+// discard (which also drops its handles and space).
+Core::Task* createUser(char const* name, Vmm::Space* space, u64 entry, u64 stackTop,
+                       Core::Capability const* handles = nullptr, usize handleCount = 0);
+void startTask(Core::Task* task);
+void discard(Core::Task* task);
+
+// Ends a task that isn't the one running (out of memory, or asked to):
+// off every queue, its resources freed now. False for the current task (it
+// ends itself through exitCurrent) and the idle task.
+bool kill(Core::Task* task, i64 code);
 
 // Every task that exists (linked by Task::allNext), dead ones not yet freed included.
 Core::Task* allTasks();

@@ -237,6 +237,57 @@ Task* spawnKernel(char const* name, void (*entry)(u64), u64 arg) {
 
 Task* spawnUser(char const* name, Vmm::Space* space, u64 entry, u64 stackTop,
                 Core::Capability const* handles, usize handleCount) {
+    Task* t = createUser(name, space, entry, stackTop, handles, handleCount);
+    if (t)
+        start(t);
+    return t;
+}
+
+void startTask(Task* t) { start(t); }
+
+void discard(Task* t) {
+    Arch::InterruptGuard guard;
+    t->releaseResources();
+    if (t->stackPhysical) {
+        unmapKernelStack(t->stackTop);
+        Pmm::free(t->stackPhysical, STACK_PAGES);
+    }
+    delete t;
+}
+
+bool kill(Task* t, i64 code) {
+    Arch::InterruptGuard guard;
+    if (t == currentTask or t == idleTask or t->state == TaskState::Dead)
+        return false;
+    // Off whichever list holds it. (A Blocked task is held by objects: the
+    // ones it waits on through its handles forget it in releaseResources.)
+    for (Queue& q : ready) {
+        Task* previous = nullptr;
+        for (Task* each = q.head; each; previous = each, each = each->next) {
+            if (each != t)
+                continue;
+            (previous ? previous->next : q.head) = t->next;
+            if (q.tail == t)
+                q.tail = previous;
+            break;
+        }
+    }
+    for (Task** link = &sleeping; *link; link = &(*link)->next) {
+        if (*link == t) {
+            *link = t->next;
+            break;
+        }
+    }
+    t->exitCode = code;
+    t->state = TaskState::Dead;
+    liveTasks--;
+    log("[sched] ", t->name, " (task ", t->id, ") was ended, code ", code);
+    destroy(t);
+    return true;
+}
+
+Task* createUser(char const* name, Vmm::Space* space, u64 entry, u64 stackTop,
+                 Core::Capability const* handles, usize handleCount) {
     Task* t = newTask(name);
     if (not t) {
         Vmm::destroyUserSpace(space);
@@ -258,8 +309,6 @@ Task* spawnUser(char const* name, Vmm::Space* space, u64 entry, u64 stackTop,
     frame->rsp = stackTop;
     frame->cs = Arch::Gdt::USER_CODE;
     frame->ss = Arch::Gdt::USER_DATA;
-
-    start(t);
     return t;
 }
 

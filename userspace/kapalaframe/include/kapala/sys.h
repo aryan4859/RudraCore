@@ -58,6 +58,11 @@ inline long spawn(char const* name, Handle const* handles = nullptr, unsigned lo
 
 inline long systemInfo(SystemInfo& out) { return syscall(SYS_SYSTEM_INFO, arg(&out)); }
 
+// Every task (up to `capacity` written): returns how many there are.
+inline long taskList(TaskInfo* out, unsigned long capacity) { return syscall(SYS_TASK_LIST, arg(out), capacity); }
+
+inline long kernelStats(KernelStats& out) { return syscall(SYS_KERNEL_STATS, arg(&out)); }
+
 // Starts a program from an ELF file in shared memory (see SpawnImage).
 inline long spawnImage(SpawnImage const& request) { return syscall(SYS_SPAWN_IMAGE, arg(&request)); }
 
@@ -118,14 +123,35 @@ inline long wait(Handle const* endpoints, unsigned long count, unsigned long tim
 
 // MARK: Memory
 
-inline long memoryCreate(unsigned long size) { return syscall(SYS_MEMORY_CREATE, size); }
+// flags: MEMORY_BELOW_4G for a device that only reaches the first 4 GiB.
+inline long memoryCreate(unsigned long size, unsigned long flags = 0) { return syscall(SYS_MEMORY_CREATE, size, flags); }
 
-inline long memoryUnmap(void* address) { return syscall(SYS_MEMORY_UNMAP, arg(address)); }
+// Removes a region (from memoryMap or memoryAlloc); private memory is freed.
+inline long memoryUnmap(void const* address) { return syscall(SYS_MEMORY_UNMAP, arg(address)); }
 
-// Returns the address, or nullptr on failure.
-inline void* memoryMap(Handle memory) {
-    long result = syscall(SYS_MEMORY_MAP, memory);
+// Returns the address, or nullptr on failure. flags: MAP_COPY (a private
+// copy-on-write view), MAP_READ_ONLY.
+inline void* memoryMap(Handle memory, unsigned long flags = 0) {
+    long result = syscall(SYS_MEMORY_MAP, memory, flags);
     return result < 0 ? nullptr : reinterpret_cast<void*>(result);
+}
+
+// A region (its address) becomes read-only, or writable again.
+inline long memoryProtect(void const* address, bool writable) {
+    return syscall(SYS_MEMORY_PROTECT, arg(address), writable ? 1 : 0);
+}
+
+// Its contents never change again, for anyone (see SYS_MEMORY_SEAL).
+inline long memorySeal(Handle memory) { return syscall(SYS_MEMORY_SEAL, memory); }
+
+inline long memoryInfo(Handle memory, MemoryInfo& out) { return syscall(SYS_MEMORY_INFO, memory, arg(&out)); }
+
+// Pagers (the fs server, for memory-mapped files).
+inline long memoryCreatePaged(unsigned long size, Handle pagerEnd) {
+    return syscall(SYS_MEMORY_CREATE_PAGED, size, pagerEnd);
+}
+inline long memorySupply(Handle pagerEnd, unsigned long offset, void const* data, unsigned long length) {
+    return syscall(SYS_MEMORY_SUPPLY, pagerEnd, offset, arg(data), length);
 }
 
 // Fresh zeroed private memory, or nullptr. (Most code uses `new` instead.)

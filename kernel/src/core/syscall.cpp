@@ -16,8 +16,10 @@
 #include "core/time.h"
 #include "display.h"
 #include "log.h"
+#include "mem/heap.h"
 #include "mem/memory.h"
 #include "mem/pmm.h"
+#include "mem/vmm.h"
 #include "rudracore/syscalls.h"
 #include "config.h"
 
@@ -37,9 +39,6 @@ namespace {
 constexpr u64 MAX_LOG_LENGTH = 1024;
 constexpr u64 MAX_SPAWN_HANDLES = 8;
 constexpr u64 INT80_LENGTH = 2; // `int $0x80` is 2 bytes: CD 80
-
-// Highest address shared memory may be mapped at (below the user stack).
-constexpr u64 MAP_LIMIT = 0x00007f0000000000;
 
 // Longest wait a program may ask for (about 34 years): keeps now + timeout
 // from wrapping around.
@@ -91,9 +90,25 @@ struct Call {
         return Sched::blockCurrent(frame);
     }
 
+    // A range of the caller's memory the call may read (or write): made
+    // present now (demand paging, copy-on-write). If a page has to come
+    // from a pager first, it's false and the whole call runs again once
+    // the page is there (dispatch sees `wait`).
     bool userMemory(u64 address, u64 length, bool writable = false) const {
-        return Vmm::isUserRange(*task->space, address, length, writable);
+        if (length == 0)
+            return address + length >= address and address <= Vmm::USER_END;
+        switch (Vm::prepare(*task, address, length, writable)) {
+        case Vm::Fault::Resolved: return true;
+        case Vm::Fault::Pending: wait = Wait::Pager; return false;
+        case Vm::Fault::Retry: wait = Wait::Moment; return false;
+        case Vm::Fault::OutOfMemory: wait = Wait::OutOfMemory; return false;
+        case Vm::Fault::Invalid: return false;
+        }
+        return false;
     }
+
+    enum class Wait : u8 { None, Pager, Moment, OutOfMemory };
+    mutable Wait wait = Wait::None;
 
     // A live handle (open, not revoked) that has all of `rights`;
     // otherwise sets `error`.
@@ -168,7 +183,7 @@ bool isHardware(Object const* object) {
     case ObjectType::IoPorts:
     case ObjectType::PciDevice:
     case ObjectType::Firmware: return true;
-    case ObjectType::Memory: return not static_cast<Core::SharedMemory const*>(object)->owned;
+    case ObjectType::Memory: return static_cast<Core::SharedMemory const*>(object)->hardware;
     case ObjectType::Channel: return false;
     }
     return true;
@@ -305,23 +320,50 @@ Arch::Frame* sysSpawnImage(Call const& c) {
     auto* memory = c.lookup<Core::SharedMemory>(request.memory, ObjectType::Memory, Abi::RIGHT_READ, error);
     if (not memory)
         return c.result(error);
-    if (not memory->owned or request.size == 0 or request.size > memory->size)
+    if (memory->hardware or memory->paged() or request.size == 0 or request.size > memory->size)
         return c.result(Abi::INVALID_ARGUMENT);
+    // The app runs from its image copy-on-write, so the image must never
+    // change: a sealed one is used as it is, any other is copied (and the
+    // copy sealed) first. The copy is charged to the caller.
+    Core::SharedMemory* image = memory;
+    if (not memory->sealed) {
+        u64 pages = Mem::alignUp(request.size, Mem::PAGE_SIZE) / Mem::PAGE_SIZE;
+        if (not c.task->quota->chargeObjects(1))
+            return c.result(Abi::OUT_OF_MEMORY);
+        if (not c.task->quota->charge(pages)) {
+            c.task->quota->refundObjects(1);
+            return c.result(Abi::OUT_OF_MEMORY);
+        }
+        image = Core::SharedMemory::allocate(request.size);
+        if (not image) {
+            c.task->quota->refund(pages);
+            c.task->quota->refundObjects(1);
+            return c.result(Abi::OUT_OF_MEMORY);
+        }
+        image->chargeTo(c.task->quota, pages);
+        memcpy(Mem::toVirtual<u8>(image->physical), Mem::toVirtual<u8>(memory->physical), request.size);
+        image->readOnly = image->sealed = true;
+    } else {
+        image->ref();
+    }
 
     // Check every handle before moving any, so a bad one changes nothing.
     // An installed app is untrusted code: each handle needs RIGHT_TRANSFER.
-    if (i64 bad = c.checkMovable(request.handles, request.handleCount, true, request.memory))
+    i64 bad = c.checkMovable(request.handles, request.handleCount, true, request.memory);
+    if (not bad)
+        bad = checkNoHardware(c, request.handles, request.handleCount); // installed apps are always apps
+    if (bad) {
+        image->unref();
         return c.result(bad);
-    if (i64 bad = checkNoHardware(c, request.handles, request.handleCount)) // installed apps are always apps
-        return c.result(bad);
+    }
     Core::Capability objects[MAX_SPAWN_HANDLES];
     for (u64 i = 0; i < request.handleCount; i++)
         objects[i] = c.task->takeHandle(request.handles[i]);
 
     Abi::Error code = Abi::OK;
     char const* why = nullptr;
-    Task* child = Programs::startImage(request.name, Mem::toVirtual<u8>(memory->physical), request.size, objects,
-                                       request.handleCount, code, why);
+    Task* child = Programs::startImage(request.name, image, request.size, objects, request.handleCount, code, why);
+    image->unref(); // (the app's regions hold their own references)
     if (not child) {
         log("[sched] ", c.task->name, " can't start the app ", static_cast<char const*>(request.name), ": ", why);
         return c.result(code);
@@ -359,6 +401,61 @@ Arch::Frame* sysSystemInfo(Call const& c, Boot::Info const& boot) {
         info.blueShift = fb.blueShift;
     }
     toUser(address, &info, sizeof(info));
+    return c.result(Abi::OK);
+}
+
+// Every task's name, CPU time and memory (per-process accounting).
+Arch::Frame* sysTaskList(Call const& c) {
+    u64 capacity = c.arg1();
+    if (capacity > 1024)
+        return c.result(Abi::INVALID_ARGUMENT);
+    if (not c.userMemory(c.arg0(), capacity * sizeof(Abi::TaskInfo), true))
+        return c.result(Abi::BAD_ADDRESS);
+    u64 count = 0;
+    for (Task* t = Sched::allTasks(); t; t = t->allNext) {
+        if (t->state == Core::TaskState::Dead)
+            continue;
+        if (count < capacity) {
+            Abi::TaskInfo info;
+            memset(&info, 0, sizeof(info));
+            info.id = t->id;
+            for (usize i = 0; i + 1 < sizeof(info.name) and t->name[i]; i++)
+                info.name[i] = t->name[i];
+            info.privilege = t->privilege == Core::Privilege::Root     ? Abi::TASK_ROOT
+                             : t->privilege == Core::Privilege::System ? Abi::TASK_SYSTEM
+                                                                       : Abi::TASK_APP;
+            info.state = t->state == Core::TaskState::Running ? Abi::TASK_RUNNING
+                         : t->state == Core::TaskState::Ready ? Abi::TASK_READY
+                                                              : Abi::TASK_WAITING;
+            info.cpuMs = t->cpuMs;
+            Vm::Usage u = Vm::usage(*t);
+            info.regions = u.regions;
+            info.residentBytes = u.resident * Mem::PAGE_SIZE;
+            info.committedBytes = u.committed * Mem::PAGE_SIZE;
+            info.sharedBytes = u.shared * Mem::PAGE_SIZE;
+            toUser(c.arg0() + count * sizeof(info), &info, sizeof(info));
+        }
+        count++;
+    }
+    return c.result(static_cast<i64>(count));
+}
+
+Arch::Frame* sysKernelStats(Call const& c) {
+    if (not c.userMemory(c.arg0(), sizeof(Abi::KernelStats), true))
+        return c.result(Abi::BAD_ADDRESS);
+    Heap::Stats heap = Heap::stats();
+    Abi::KernelStats s;
+    memset(&s, 0, sizeof(s));
+    s.heapBytes = heap.bytesInUse;
+    s.heapPeakBytes = heap.peakBytes;
+    s.heapPages = heap.pagesUsed;
+    s.heapAllocations = heap.allocations;
+    s.heapFailures = heap.failures;
+    s.pageTablePages = Vmm::tablePages();
+    s.promisedBytes = Pmm::stats().promisedPages * Mem::PAGE_SIZE;
+    for (Core::SharedMemory* o = Core::SharedMemory::allPaged(); o; o = o->nextPaged)
+        s.fileBytes += o->residentPages * Mem::PAGE_SIZE;
+    toUser(c.arg0(), &s, sizeof(s));
     return c.result(Abi::OK);
 }
 
@@ -467,17 +564,7 @@ Arch::Frame* sysHandleRevoke(Call const& c) {
         }
         break;
     case ObjectType::Memory:
-        for (Task* t = Sched::allTasks(); t; t = t->allNext) {
-            if (t == c.task or not t->space)
-                continue;
-            for (auto& mapping : t->mappings) {
-                if (mapping.object == object) {
-                    t->space->unmap(mapping.address, mapping.size);
-                    object->unref();
-                    mapping = {};
-                }
-            }
-        }
+        Vm::revoke(static_cast<Core::SharedMemory*>(object), c.task);
         break;
     case ObjectType::IoPorts:
     case ObjectType::PciDevice:
@@ -683,20 +770,13 @@ Arch::Frame* sysWait(Call const& c) {
 
 // MARK: Memory
 
+// Any region: shared memory, private memory, a mapped file.
 Arch::Frame* sysMemoryUnmap(Call const& c) {
-    for (auto& mapping : c.task->mappings) {
-        if (mapping.object and mapping.address == c.arg0()) {
-            c.task->space->unmap(mapping.address, mapping.size);
-            mapping.object->unref();
-            mapping = {};
-            return c.result(Abi::OK);
-        }
-    }
-    return c.result(Abi::NOT_FOUND);
+    return c.result(Vm::unmap(*c.task, c.arg0()));
 }
 
 Arch::Frame* sysMemoryCreate(Call const& c) {
-    if (c.arg0() == 0 or c.arg0() > Core::SharedMemory::MAX_SIZE)
+    if (c.arg0() == 0 or c.arg0() > Core::SharedMemory::MAX_SIZE or (c.arg1() & ~Abi::MEMORY_BELOW_4G))
         return c.result(Abi::INVALID_ARGUMENT);
     u64 pages = Mem::alignUp(c.arg0(), Mem::PAGE_SIZE) / Mem::PAGE_SIZE;
     Core::Quota& quota = *c.task->quota;
@@ -706,7 +786,7 @@ Arch::Frame* sysMemoryCreate(Call const& c) {
         quota.refundObjects(1);
         return c.result(Abi::OUT_OF_MEMORY);
     }
-    auto* memory = Core::SharedMemory::allocate(c.arg0());
+    auto* memory = Core::SharedMemory::allocate(c.arg0(), (c.arg1() & Abi::MEMORY_BELOW_4G) ? Pmm::BELOW_4G : 0);
     if (not memory) {
         quota.refund(pages);
         quota.refundObjects(1);
@@ -722,78 +802,151 @@ Arch::Frame* sysMemoryCreate(Call const& c) {
     return c.result(static_cast<i64>(handle));
 }
 
+// (Handle memory, u64 flags): shared, or with MAP_COPY a private
+// copy-on-write view; MAP_READ_ONLY maps it read-only even with RIGHT_WRITE.
 Arch::Frame* sysMemoryMap(Call const& c) {
     i64 error = 0;
     auto* memory = c.lookup<Core::SharedMemory>(c.arg0(), ObjectType::Memory, Abi::RIGHT_READ, error);
     if (not memory)
         return c.result(error);
-    bool writable = not memory->readOnly and (c.task->handle(c.arg0())->rights & Abi::RIGHT_WRITE);
-
-    Core::Mapping* slot = nullptr;
-    for (auto& mapping : c.task->mappings) {
-        if (not mapping.object) {
-            slot = &mapping;
-            break;
-        }
-    }
-
-    u64 address = c.task->nextMapAddress;
-    if (not slot or address + memory->size > MAP_LIMIT)
-        return c.result(Abi::NO_SPACE);
-
-    u32 access = Vmm::USER | (writable ? Vmm::WRITE : 0); // not OWNED: the object owns the pages
-    if (not c.task->space->map(address, memory->physical, memory->size, access, memory->cache)) {
-        c.task->space->unmap(address, memory->size);
-        return c.result(Abi::OUT_OF_MEMORY);
-    }
-
-    memory->ref();
-    *slot = {memory, address, memory->size};
-    c.task->nextMapAddress = address + memory->size + Mem::PAGE_SIZE; // gap between mappings
-
+    u64 flags = c.arg1();
+    if (flags & ~(Abi::MAP_COPY | Abi::MAP_READ_ONLY))
+        return c.result(Abi::INVALID_ARGUMENT);
+    bool copy = flags & Abi::MAP_COPY;
+    if (copy and memory->hardware)
+        return c.result(Abi::INVALID_ARGUMENT); // (a device's registers have no "copy")
+    // A shared mapping writes the object: only with RIGHT_WRITE, and never a
+    // read-only or sealed object. A copy writes only its own pages.
+    bool writable = not(flags & Abi::MAP_READ_ONLY) and
+                    (copy or (not memory->readOnly and not memory->sealed and
+                              (c.task->handle(c.arg0())->rights & Abi::RIGHT_WRITE)));
+    u64 address = 0;
+    i64 result = Vm::mapObject(*c.task, memory, copy ? Vm::Kind::Copy : Vm::Kind::Shared, 0, memory->size,
+                               memory->size, writable, false, 0, address);
+    if (result != Abi::OK)
+        return c.result(result);
     if (memory->isScreen)
         Display::handOverToUserspace();
     return c.result(static_cast<i64>(address));
 }
 
-// Private memory: fresh zeroed pages owned by the task's address space
-// (freed when the task ends). Pages needn't be physically contiguous.
+// Private memory: zero-filled pages owned by the task, allocated as they're
+// first touched (promised now, so a touch never runs out). Freed with
+// memory_unmap or when the task ends.
 Arch::Frame* sysMemoryAlloc(Call const& c) {
     constexpr u64 MAX_ALLOC = 256 * 1024 * 1024;
     u64 size = Mem::alignUp(c.arg0(), Mem::PAGE_SIZE);
     if (size == 0 or size > MAX_ALLOC)
         return c.result(Abi::INVALID_ARGUMENT);
-
-    u64 address = c.task->nextMapAddress;
-    if (address + size > MAP_LIMIT)
-        return c.result(Abi::NO_SPACE);
+    // Page tables for it, which aren't promised: from the reserve's margin.
     u64 pages = size / Mem::PAGE_SIZE;
-    if (not Pmm::userCanUse(pages + pages / 512 + 3)) // + page tables
+    if (not Pmm::userCanUse(pages / 512 + 3))
         return c.result(Abi::OUT_OF_MEMORY);
-    if (not c.task->quota->charge(pages))
-        return c.result(Abi::OUT_OF_MEMORY);
+    u64 address = 0;
+    i64 result = Vm::mapAnonymous(*c.task, size, true, 0, address);
+    return c.result(result == Abi::OK ? static_cast<i64>(address) : result);
+}
 
-    auto& space = *c.task->space;
-    for (u64 offset = 0; offset < size; offset += Mem::PAGE_SIZE) {
-        u64 page = Pmm::allocZeroed();
-        if (not page or not space.map(address + offset, page, Mem::PAGE_SIZE,
-                                      Vmm::USER | Vmm::WRITE | Vmm::OWNED)) {
-            // Give back what was mapped so far.
-            if (page)
-                Pmm::free(page);
-            for (u64 undo = 0; undo < offset; undo += Mem::PAGE_SIZE) {
-                u64 physical;
-                if (space.translate(address + undo, physical))
-                    Pmm::free(physical);
-            }
-            space.unmap(address, offset);
-            c.task->quota->refund(pages);
-            return c.result(Abi::OUT_OF_MEMORY);
-        }
+// (address, u64 writable): a region becomes read-only (or writable again).
+Arch::Frame* sysMemoryProtect(Call const& c) {
+    if (c.arg1() > 1)
+        return c.result(Abi::INVALID_ARGUMENT);
+    return c.result(Vm::protect(*c.task, c.arg0(), c.arg1()));
+}
+
+// Seals a memory object: its contents never change again, for anyone.
+// Writable shared mappings (everywhere) become read-only. Who receives a
+// sealed object can check its contents once and trust them (MEMORY_SEALED).
+// Needs RIGHT_WRITE (it's a change to the object) and RIGHT_REVOKE (it takes
+// writing away from everyone else).
+Arch::Frame* sysMemorySeal(Call const& c) {
+    i64 error = 0;
+    auto* memory = c.lookup<Core::SharedMemory>(c.arg0(), ObjectType::Memory, Abi::RIGHT_WRITE | Abi::RIGHT_REVOKE,
+                                                error);
+    if (not memory)
+        return c.result(error);
+    if (memory->hardware or memory->dmaMapped or memory->paged())
+        return c.result(Abi::INVALID_ARGUMENT); // (a device could still write it)
+    Vm::seal(memory);
+    memory->readOnly = true;
+    return c.result(Abi::OK);
+}
+
+// (Handle memory, MemoryInfo* out): its size and what it is.
+Arch::Frame* sysMemoryInfo(Call const& c) {
+    i64 error = 0;
+    auto* memory = c.lookup<Core::SharedMemory>(c.arg0(), ObjectType::Memory, Abi::RIGHT_READ, error);
+    if (not memory)
+        return c.result(error);
+    if (not c.userMemory(c.arg1(), sizeof(Abi::MemoryInfo), true))
+        return c.result(Abi::BAD_ADDRESS);
+    Abi::MemoryInfo info{};
+    info.size = memory->size;
+    info.flags = (memory->sealed ? Abi::MEMORY_SEALED : 0) | (memory->readOnly ? Abi::MEMORY_READ_ONLY : 0) |
+                 (memory->paged() ? Abi::MEMORY_PAGED : 0);
+    toUser(c.arg1(), &info, sizeof(info));
+    return c.result(Abi::OK);
+}
+
+// (u64 size, Handle pager): a paged object. `pager` is one end of a channel
+// (it moves to the kernel); page requests arrive at its peer, and the pager
+// answers each with memory_supply.
+Arch::Frame* sysMemoryCreatePaged(Call const& c) {
+    i64 error = 0;
+    if (c.arg0() == 0 or c.arg0() > Core::SharedMemory::MAX_SIZE)
+        return c.result(Abi::INVALID_ARGUMENT);
+    auto* end = c.lookup<Core::Endpoint>(c.arg1(), ObjectType::Channel, Abi::RIGHT_WRITE, error);
+    if (not end)
+        return c.result(error);
+    if (end->pagerOf or not end->peer or end->waiter)
+        return c.result(Abi::INVALID_ARGUMENT);
+    if (not Pmm::userCanUse(c.arg0() / Mem::PAGE_SIZE / 512 + 1) or not c.task->quota->chargeObjects(1))
+        return c.result(Abi::OUT_OF_MEMORY);
+    auto* memory = Core::SharedMemory::createPaged(c.arg0(), end);
+    if (not memory) {
+        c.task->quota->refundObjects(1);
+        return c.result(Abi::OUT_OF_MEMORY);
     }
+    memory->chargeTo(c.task->quota, 0);
+    u64 handle = c.task->addHandle({memory, MEMORY_RIGHTS & ~Abi::RIGHT_WRITE, 0});
+    if (not handle) {
+        memory->unref();
+        return c.result(Abi::NO_SPACE);
+    }
+    c.task->takeHandle(c.arg1()).object->unref(); // the kernel's reference (createPaged's) keeps it
+    return c.result(static_cast<i64>(handle));
+}
 
-    c.task->nextMapAddress = address + size + Mem::PAGE_SIZE;
-    return c.result(static_cast<i64>(address));
+// (Handle pager end, u64 offset, void const* data, u64 length): the pager
+// answers a request, a page at a time; pages already there are left as
+// they are. Called on the pager's own end of the channel.
+Arch::Frame* sysMemorySupply(Call const& c) {
+    i64 error = 0;
+    auto* end = c.lookup<Core::Endpoint>(c.arg0(), ObjectType::Channel, Abi::RIGHT_READ, error);
+    if (not end)
+        return c.result(error);
+    Core::SharedMemory* memory = end->peer ? end->peer->pagerOf : nullptr;
+    u64 offset = c.arg1(), length = c.arg3();
+    if (not memory or offset % Mem::PAGE_SIZE or length % Mem::PAGE_SIZE or length == 0 or offset > memory->size or
+        length > memory->size - offset)
+        return c.result(Abi::INVALID_ARGUMENT);
+    if (not c.userMemory(c.arg2(), length))
+        return c.result(Abi::BAD_ADDRESS);
+    for (u64 at = 0; at < length; at += Mem::PAGE_SIZE) {
+        u64 index = (offset + at) / Mem::PAGE_SIZE;
+        if (memory->pageAt(index))
+            continue;
+        // A file's pages are a cache: when memory is short they come out of
+        // other files first (reclaim), then this one gives up.
+        if (not Pmm::userCanUse(1))
+            return c.result(Abi::OUT_OF_MEMORY);
+        u64 page = Pmm::alloc();
+        if (not page)
+            return c.result(Abi::OUT_OF_MEMORY);
+        fromUser(Mem::toVirtual(page), c.arg2() + at, Mem::PAGE_SIZE);
+        Vm::supplied(memory, index, page);
+    }
+    return c.result(Abi::OK);
 }
 
 // MARK: Devices
@@ -1110,11 +1263,53 @@ void init(Boot::Info const& info) {
     bootInfo = &info;
 }
 
+namespace {
+
+Arch::Frame* run(Call const& c);
+
+} // namespace
+
 Arch::Frame* dispatch(Arch::Frame* frame) {
     Call c{frame, Sched::current()};
     if (not c.task->isUser())
         return c.result(Abi::UNKNOWN_SYSCALL); // kernel tasks use Sched directly
+    u64 number = frame->rax;
+    Arch::Frame* next = run(c);
+    if (c.wait == Call::Wait::None)
+        return next;
 
+    // A buffer the call needed wasn't there yet: the call runs again, from
+    // the start, once it can be (its result so far is dropped).
+    auto again = [&] {
+        frame->rax = number;
+        frame->rip -= INT80_LENGTH;
+    };
+    switch (c.wait) {
+    case Call::Wait::Pager:
+        again();
+        return Sched::blockCurrent(frame);
+    case Call::Wait::Moment:
+        again();
+        return Sched::sleepCurrent(frame, 1);
+    case Call::Wait::OutOfMemory:
+        if (Task* victim = Vm::outOfMemory(c.task)) {
+            if (victim == c.task)
+                return Sched::exitCurrent(frame, -1);
+            again(); // another app's memory is free now
+            return frame;
+        }
+        frame->rax = static_cast<u64>(Abi::OUT_OF_MEMORY);
+        return frame;
+    case Call::Wait::None:
+        break;
+    }
+    return next;
+}
+
+namespace {
+
+Arch::Frame* run(Call const& c) {
+    Arch::Frame* frame = c.frame;
     switch (frame->rax) {
     case Abi::SYS_LOG: return sysLog(c);
     case Abi::SYS_EXIT: return Sched::exitCurrent(frame, static_cast<i64>(c.arg0()));
@@ -1146,6 +1341,11 @@ Arch::Frame* dispatch(Arch::Frame* frame) {
     case Abi::SYS_MEMORY_MAP: return sysMemoryMap(c);
     case Abi::SYS_MEMORY_ALLOC: return sysMemoryAlloc(c);
     case Abi::SYS_MEMORY_UNMAP: return sysMemoryUnmap(c);
+    case Abi::SYS_MEMORY_PROTECT: return sysMemoryProtect(c);
+    case Abi::SYS_MEMORY_SEAL: return sysMemorySeal(c);
+    case Abi::SYS_MEMORY_INFO: return sysMemoryInfo(c);
+    case Abi::SYS_MEMORY_CREATE_PAGED: return sysMemoryCreatePaged(c);
+    case Abi::SYS_MEMORY_SUPPLY: return sysMemorySupply(c);
 
     case Abi::SYS_IRQ_WAIT: return sysIrqWait(c);
     case Abi::SYS_PORT_IN: return sysPortIn(c);
@@ -1164,9 +1364,13 @@ Arch::Frame* dispatch(Arch::Frame* frame) {
     case Abi::SYS_DEVICE_MSI: return sysDeviceMsi(c);
     case Abi::SYS_BOOT_COMPLETE: return sysBootComplete(c);
     case Abi::SYS_FIRMWARE_PERFORMANCE: return sysFirmwarePerformance(c);
+    case Abi::SYS_TASK_LIST: return sysTaskList(c);
+    case Abi::SYS_KERNEL_STATS: return sysKernelStats(c);
 
     default: return c.result(Abi::UNKNOWN_SYSCALL);
     }
 }
+
+} // namespace
 
 } // namespace Rudracore::Syscall

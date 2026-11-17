@@ -33,6 +33,14 @@ struct Space {
 
     void unmap(u64 virt, u64 size);
 
+    // One 4 KiB page: removes its mapping and says what it was (its physical
+    // page, and whether the space owned it). False if nothing was mapped
+    // there (or a 2 MiB page covers it).
+    bool take(u64 virt, u64& phys, bool& owned);
+
+    // One 4 KiB page that's mapped: new access, same page (OWNED kept).
+    bool update(u64 virt, u32 access);
+
     // Looks up the physical address `virt` maps to. Returns false if unmapped.
     bool translate(u64 virt, u64& phys) const;
 

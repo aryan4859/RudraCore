@@ -11,6 +11,7 @@
 #include "core/device.h"
 #include "core/sched.h"
 #include "core/syscall.h"
+#include "core/vm.h"
 #include "log.h"
 #include "panic.h"
 #include "rudracore/syscalls.h"
@@ -180,6 +181,23 @@ extern "C" Frame* interruptDispatch(Frame* frame) {
         return frame; // readMsrSafe/writeMsrSafe probed an MSR this CPU lacks
     if (Efi::recoverFault(*frame))
         return frame; // the firmware faulted: its call fails, the kernel goes on
+
+    // A program touched memory that isn't mapped yet: demand paging,
+    // copy-on-write, a page from a pager.
+    if (vector == Idt::VECTOR_PAGE_FAULT and fromUser) {
+        Core::Task* task = Sched::current();
+        switch (Vm::fault(*task, readCr2(), frame->error & 2, frame->error & 16)) {
+        case Vm::Fault::Resolved: return frame;
+        case Vm::Fault::Pending: return Sched::blockCurrent(frame); // the instruction runs again when the page is in
+        case Vm::Fault::Retry: return Sched::sleepCurrent(frame, 1);
+        case Vm::Fault::OutOfMemory:
+            if (Core::Task* victim = Vm::outOfMemory(task); victim and victim != task)
+                return frame; // memory is free again: run the instruction again
+            log("[vm]   ", task->name, " (task ", task->id, ") ran out of memory");
+            return Sched::exitCurrent(frame, -1);
+        case Vm::Fault::Invalid: break; // a real fault
+        }
+    }
 
     if (vector < 32) {
         if (fromUser and vector != Idt::VECTOR_MACHINE_CHECK) { // (#MC is the machine's, not the task's)

@@ -1,4 +1,5 @@
 #include "core/channel.h"
+#include "core/device.h"
 #include "core/sched.h"
 
 namespace Rudracore::Core {
@@ -42,6 +43,8 @@ void Task::releaseResources() {
                 if (endpoint->waiter == this)
                     endpoint->waiter = nullptr;
             }
+            if (object->type == ObjectType::Irq and static_cast<Irq*>(object)->waiter == this)
+                static_cast<Irq*>(object)->waiter = nullptr; // (a task ended while it waited)
             object->unref();
             slot.cap = {};
         }
@@ -54,12 +57,7 @@ void Task::releaseResources() {
         space = nullptr;
     }
 
-    for (auto& mapping : mappings) {
-        if (mapping.object) {
-            mapping.object->unref();
-            mapping = {};
-        }
-    }
+    Vm::release(*this); // its regions: promises and quota back, objects let go
 
     if (quota) {
         quota->unref();

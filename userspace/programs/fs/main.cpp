@@ -1270,7 +1270,76 @@ long applyScope(Client const& client, Fs::Request& request) {
     return Sys::OK;
 }
 
-Fs::Reply handle(Client& client, Fs::Request& request, Sys::Handle attached) {
+// MARK: Memory-mapped files: this server is their pager.
+
+constexpr int MAX_MAPPED = 32;
+
+struct MappedFile {
+    bool used = false;
+    Channel pager; // page requests arrive here; answered with memory_supply on it
+    Node node;     // the file as it was when mapped
+};
+MappedFile mapped[MAX_MAPPED];
+alignas(4096) u8 pageBuffer[4096];
+
+// The file changed (written, truncated, removed): its mappings stop getting
+// pages, since its clusters may now hold another file's data. The kernel
+// then ends a program that touches a page it doesn't have yet.
+void dropMappings(Node const& node) {
+    for (auto& m : mapped) {
+        if (m.used and m.node.cluster() == node.cluster()) {
+            m.pager = Channel();
+            m.used = false;
+        }
+    }
+}
+
+long mapFile(Node const& node, Sys::Handle& memory) {
+    MappedFile* slot = nullptr;
+    for (auto& m : mapped) {
+        if (not m.used) {
+            slot = &m;
+            break;
+        }
+    }
+    if (not slot)
+        return Sys::NO_SPACE;
+    if (node.size() == 0)
+        return Sys::INVALID_ARGUMENT; // (nothing to map)
+    Channel mine, kernels;
+    if (long r = Channel::createPair(mine, kernels))
+        return r;
+    long handle = Sys::memoryCreatePaged(node.size(), kernels.handle());
+    if (handle < 0)
+        return handle;
+    kernels.release(); // (it moved to the kernel)
+    slot->used = true;
+    slot->pager = static_cast<Channel&&>(mine);
+    slot->node = node;
+    memory = static_cast<Sys::Handle>(handle);
+    return Sys::OK;
+}
+
+// Answers a mapped file's page requests; false once nobody maps it anymore.
+bool servePages(MappedFile& m) {
+    for (;;) {
+        Sys::PageRequest request{};
+        long r = m.pager.recv(request, nullptr, Sys::RECV_NONBLOCK);
+        if (r == Sys::WOULD_BLOCK)
+            return true;
+        if (r != Sys::OK)
+            return false; // the memory is gone (PEER_CLOSED)
+        for (unsigned long at = 0; at < request.length; at += sizeof(pageBuffer)) {
+            u64 done = 0;
+            memset(pageBuffer, 0, sizeof(pageBuffer));
+            if (request.offset + at < m.node.size())
+                readFile(m.node, request.offset + at, pageBuffer, sizeof(pageBuffer), done);
+            Sys::memorySupply(m.pager.handle(), request.offset + at, pageBuffer, sizeof(pageBuffer));
+        }
+    }
+}
+
+Fs::Reply handle(Client& client, Fs::Request& request, Sys::Handle attached, Sys::Handle& replyAttach) {
     Fs::Reply reply{};
     request.path[Fs::MAX_PATH - 1] = '\0';
 
@@ -1313,6 +1382,16 @@ Fs::Reply handle(Client& client, Fs::Request& request, Sys::Handle attached) {
         break;
     }
 
+    case Fs::Op::Map: {
+        reply.status = volume.resolve(request.path, node);
+        if (reply.status == Sys::OK and node.directory())
+            reply.status = Sys::IS_DIRECTORY;
+        if (reply.status == Sys::OK)
+            reply.status = mapFile(node, replyAttach);
+        reply.size = node.size();
+        break;
+    }
+
     case Fs::Op::Write: {
         u32 parent;
         char name[256];
@@ -1321,6 +1400,8 @@ Fs::Reply handle(Client& client, Fs::Request& request, Sys::Handle attached) {
             found = volume.create(parent, name, ATTR_ARCHIVE, 0, node);
         else if (found == Sys::ALREADY_EXISTS)
             found = node.directory() ? Sys::IS_DIRECTORY : Sys::OK;
+        if (found == Sys::OK and node.cluster())
+            dropMappings(node);
         if (found == Sys::OK and (request.flags & Fs::TRUNCATE))
             found = truncate(node);
         if (found == Sys::OK)
@@ -1379,6 +1460,8 @@ Fs::Reply handle(Client& client, Fs::Request& request, Sys::Handle attached) {
         if (reply.status == Sys::OK and node.directory() and node.cluster() and not volume.empty(node.cluster()))
             reply.status = Sys::NOT_EMPTY;
         if (reply.status == Sys::OK) {
+            if (node.cluster())
+                dropMappings(node);
             volume.freeChain(node.cluster());
             volume.erase(node);
             if (not cache.flush())
@@ -1506,11 +1589,13 @@ void serve(Client& client) {
         return;
     }
     Fs::Reply reply{};
+    Sys::Handle replyAttach = Sys::NO_HANDLE;
     if (result == Sys::OK)
-        reply = handle(client, request, attached);
+        reply = handle(client, request, attached, replyAttach);
     else
         reply.status = Sys::INVALID_ARGUMENT;
-    client.channel.send(reply);
+    if (client.channel.send(reply, replyAttach) != Sys::OK and replyAttach)
+        Sys::close(replyAttach);
 }
 
 } // namespace
@@ -1522,9 +1607,10 @@ int main() {
         log("no usable FAT32 disk: files are unavailable");
 
     bool listening = true;
+    constexpr int PAGER = 1000; // owners from here on: mapped files' pager channels
     for (;;) {
-        Sys::Handle handles[1 + MAX_CLIENTS];
-        int owners[1 + MAX_CLIENTS];
+        Sys::Handle handles[Sys::MAX_WAIT];
+        int owners[Sys::MAX_WAIT];
         unsigned long count = 0;
         if (listening) {
             handles[count] = connect.handle();
@@ -1536,6 +1622,14 @@ int main() {
                 owners[count++] = i;
             }
         }
+        // shortcut: only as many mapped files as fit in one wait; more go
+        // unserved until others close. Fine for today's few mappings.
+        for (int i = 0; i < MAX_MAPPED and count < Sys::MAX_WAIT; i++) {
+            if (mapped[i].used) {
+                handles[count] = mapped[i].pager.handle();
+                owners[count++] = PAGER + i;
+            }
+        }
 
         if (count == 0)
             return 0; // nobody can reach this server anymore
@@ -1544,6 +1638,14 @@ int main() {
             continue;
         if (owners[index] < 0) {
             listening = acceptClient(connect);
+            continue;
+        }
+        if (owners[index] >= PAGER) {
+            MappedFile& m = mapped[owners[index] - PAGER];
+            if (not servePages(m)) {
+                m.pager = Channel();
+                m.used = false;
+            }
             continue;
         }
 

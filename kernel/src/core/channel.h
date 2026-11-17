@@ -6,6 +6,7 @@
 namespace Rudracore::Core {
 
 struct Task;
+struct SharedMemory;
 
 struct Message {
     u8 data[Abi::MAX_MESSAGE_SIZE];
@@ -24,6 +25,7 @@ struct Endpoint : public Object {
     u32 head = 0;
     u32 count = 0;
     Task* waiter = nullptr; // a task blocked in recv on this endpoint
+    SharedMemory* pagerOf = nullptr; // the paged object whose requests this sends (not a reference)
 
     Endpoint() : Object(ObjectType::Channel) {}
     ~Endpoint() override;

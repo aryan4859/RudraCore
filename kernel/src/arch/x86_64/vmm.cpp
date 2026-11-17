@@ -221,6 +221,42 @@ void Space::unmap(u64 virt, u64 size) {
     }
 }
 
+namespace {
+
+// The 4 KiB page-table entry for `virt`, or nullptr (not mapped, or a 2 MiB page).
+u64* leafEntry(u64 root, u64 virt) {
+    u64* pdpt = nextTable(table(root), index(virt, 3), false, false);
+    u64* pd = pdpt ? nextTable(pdpt, index(virt, 2), false, false) : nullptr;
+    u64* pt = pd ? nextTable(pd, index(virt, 1), false, false) : nullptr;
+    if (not pt or not(pt[index(virt, 0)] & PRESENT))
+        return nullptr;
+    return &pt[index(virt, 0)];
+}
+
+} // namespace
+
+bool Space::take(u64 virt, u64& phys, bool& owned) {
+    u64* e = leafEntry(root, virt);
+    if (not e)
+        return false;
+    phys = *e & ADDRESS_MASK;
+    owned = *e & OWNED_PAGE;
+    *e = 0;
+    Arch::invalidatePage(virt);
+    return true;
+}
+
+bool Space::update(u64 virt, u32 access) {
+    u64* e = leafEntry(root, virt);
+    if (not e)
+        return false;
+    u64 keep = *e & (ADDRESS_MASK | PWT | PCD | PAT_4K | OWNED_PAGE);
+    u64 flags = leafFlags(access & ~OWNED, Cache::WriteBack, false) & ~(PWT | PCD | PAT_4K);
+    *e = keep | flags;
+    Arch::invalidatePage(virt);
+    return true;
+}
+
 bool Space::translate(u64 virt, u64& phys) const {
     bool writable;
     return query(virt, phys, writable);

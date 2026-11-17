@@ -1,10 +1,15 @@
 #include "core/elf.h"
 
+#include "core/sched.h"
+#include "core/shared_memory.h"
+#include "core/vm.h"
 #include "mem/memory.h"
 #include "mem/pmm.h"
-#include "core/sched.h"
+#include "rudracore/syscalls.h"
 
-static_assert(Rudracore::Elf::USER_IMAGE_END <= Rudracore::Core::Task::MAP_BASE, "program images must stay below shared memory");
+static_assert(Rudracore::Elf::USER_IMAGE_END <= Rudracore::Vm::MAP_BASE, "program images must stay below shared memory");
+static_assert(Rudracore::Elf::USER_STACK_TOP - Rudracore::Elf::USER_STACK_SIZE >= Rudracore::Vm::MAP_LIMIT,
+              "the stack must stay above the mappings");
 
 extern "C" void* memcpy(void* dest, void const* src, usize n);
 
@@ -176,22 +181,54 @@ bool loadSegment(Vmm::Space& space, u8 const* data, usize size, ProgramHeader co
     return true;
 }
 
-bool mapStack(Vmm::Space& space) {
-    for (u64 page = USER_STACK_TOP - USER_STACK_SIZE; page < USER_STACK_TOP; page += Mem::PAGE_SIZE) {
-        u64 physical = Pmm::allocZeroed();
-        if (not physical)
-            return false;
-        if (not space.map(page, physical, Mem::PAGE_SIZE, Vmm::USER | Vmm::OWNED | Vmm::WRITE)) {
-            Pmm::free(physical);
-            return false;
+// True if two loadable segments share a page (allowed when their access is
+// the same): then regions can't describe them, and they're copied in.
+bool segmentsSharePages(ProgramHeader const* headers, u16 count) {
+    for (u16 i = 0; i < count; i++) {
+        if (headers[i].type != SEGMENT_LOAD or headers[i].memorySize == 0)
+            continue;
+        for (u16 j = 0; j < i; j++) {
+            if (headers[j].type == SEGMENT_LOAD and headers[j].memorySize and
+                firstPage(headers[i]) < endPage(headers[j]) and firstPage(headers[j]) < endPage(headers[i]))
+                return true;
         }
     }
-    return true;
+    return false;
 }
 
 } // namespace
 
-bool load(u8 const* data, usize size, Program& out, char const*& error) {
+bool mapRegions(Core::Task& task, Core::SharedMemory* image, usize size, Program const& program, char const*& error) {
+    (void)size;
+    u8 const* data = Mem::toVirtual<u8>(image->physical);
+    auto const* header = reinterpret_cast<Header const*>(data);
+    auto const* headers = reinterpret_cast<ProgramHeader const*>(data + header->programHeaderOffset);
+    u64 at;
+    for (u16 i = 0; not program.loaded and i < header->programHeaderCount; i++) {
+        ProgramHeader const& ph = headers[i];
+        if (ph.type != SEGMENT_LOAD or ph.memorySize == 0)
+            continue;
+        // Whole pages: the segment's first page starts that much before it in the file.
+        u64 start = firstPage(ph), lead = ph.vaddr - start;
+        if (Vm::mapObject(task, image, Vm::Kind::Copy, ph.offset - lead, endPage(ph) - start, lead + ph.fileSize,
+                          ph.flags & FLAG_WRITE, ph.flags & FLAG_EXEC, start, at) != Abi::OK) {
+            error = OUT_OF_MEMORY;
+            return false;
+        }
+    }
+    if (Vm::mapAnonymous(task, USER_STACK_SIZE, true, USER_STACK_TOP - USER_STACK_SIZE, at) != Abi::OK) {
+        error = OUT_OF_MEMORY;
+        return false;
+    }
+    return true;
+}
+
+bool load(Core::SharedMemory* image, usize size, Program& out, char const*& error) {
+    u8 const* data = Mem::toVirtual<u8>(image->physical);
+    if (size > image->size) {
+        error = "file too small";
+        return false;
+    }
     if (not validHeader(data, size, error))
         return false;
 
@@ -228,39 +265,37 @@ bool load(u8 const* data, usize size, Program& out, char const*& error) {
         total += headers[i].memorySize;
     }
 
-    // All it will take: segments (each may straddle one more page), page
-    // tables, its stack, and the task's kernel stack and state.
-    u64 pages = total / Mem::PAGE_SIZE + 2 * header->programHeaderCount + USER_STACK_SIZE / Mem::PAGE_SIZE + 16;
-    if (not Pmm::userCanUse(pages)) {
-        error = OUT_OF_MEMORY;
-        Vmm::destroyUserSpace(space);
-        return false;
-    }
-
     bool loadedAny = false;
-    for (u16 i = 0; i < header->programHeaderCount; i++) {
-        if (headers[i].type != SEGMENT_LOAD or headers[i].memorySize == 0)
-            continue;
-        if (not loadSegment(*space, data, size, headers[i], error)) {
-            Vmm::destroyUserSpace(space);
-            return false;
-        }
-        loadedAny = true;
-    }
-
+    for (u16 i = 0; i < header->programHeaderCount; i++)
+        loadedAny = loadedAny or (headers[i].type == SEGMENT_LOAD and headers[i].memorySize);
     if (not loadedAny) {
         error = "no loadable segments";
         Vmm::destroyUserSpace(space);
         return false;
     }
 
-    if (not mapStack(*space)) {
-        error = OUT_OF_MEMORY;
-        Vmm::destroyUserSpace(space);
-        return false;
+    // Segments sharing pages: copied in now, the way programs always were.
+    bool copy = segmentsSharePages(headers, header->programHeaderCount);
+    if (copy) {
+        // All it will take: segments (each may straddle one more page), page
+        // tables, and the task's kernel stack and state.
+        u64 pages = total / Mem::PAGE_SIZE + 2 * header->programHeaderCount + 16;
+        if (not Pmm::userCanUse(pages)) {
+            error = OUT_OF_MEMORY;
+            Vmm::destroyUserSpace(space);
+            return false;
+        }
+        for (u16 i = 0; i < header->programHeaderCount; i++) {
+            if (headers[i].type != SEGMENT_LOAD or headers[i].memorySize == 0)
+                continue;
+            if (not loadSegment(*space, data, size, headers[i], error)) {
+                Vmm::destroyUserSpace(space);
+                return false;
+            }
+        }
     }
 
-    out = {space, header->entry, USER_STACK_TOP};
+    out = {space, header->entry, USER_STACK_TOP, copy};
     return true;
 }
 

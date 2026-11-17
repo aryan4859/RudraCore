@@ -73,12 +73,31 @@ enum Syscall : unsigned long {
                                //   other program; blocked waiters wake up. Needs RIGHT_REVOKE.
     SYS_HANDLE_RIGHTS = 19,    // (Handle) -> the handle's rights
 
-    // Memory
-    SYS_MEMORY_CREATE = 20, // (usize size) -> Handle to new zeroed shared memory
-    SYS_MEMORY_MAP = 21,    // (Handle memory) -> address where it's mapped. Needs RIGHT_READ; writable
-                            //   only with RIGHT_WRITE.
+    // Memory. A program's memory is regions; pages are allocated when first
+    // touched (but promised and charged to its quota when the region is made,
+    // so touching never runs out).
+    SYS_MEMORY_CREATE = 20, // (usize size, u64 flags) -> Handle to new zeroed shared memory, physically
+                            //   contiguous. flags: MEMORY_BELOW_4G for devices that only reach 32 bits.
+    SYS_MEMORY_MAP = 21,    // (Handle memory, u64 flags) -> address where it's mapped. Needs RIGHT_READ.
+                            //   Shared: writable only with RIGHT_WRITE, never if read-only or sealed.
+                            //   MAP_COPY: a private copy-on-write view (writable; pages are the object's
+                            //   until written). MAP_READ_ONLY: read-only either way.
     SYS_MEMORY_ALLOC = 22,  // (usize size) -> address of new zeroed private memory (read + write)
-    SYS_MEMORY_UNMAP = 23,  // (address returned by SYS_MEMORY_MAP): remove that mapping
+    SYS_MEMORY_UNMAP = 23,  // (address returned by SYS_MEMORY_MAP or SYS_MEMORY_ALLOC): remove that region
+    SYS_MEMORY_PROTECT = 24, // (address of a region, u64 writable 0/1): read-only, or writable again
+                             //   (only if it was made writable)
+    SYS_MEMORY_SEAL = 25,    // (Handle memory): its contents never change again, for anyone (writable
+                             //   mappings everywhere become read-only). Needs RIGHT_WRITE and RIGHT_REVOKE.
+                             //   Not for device memory or memory a device was given.
+    SYS_MEMORY_INFO = 26,    // (Handle memory, MemoryInfo* out). Needs RIGHT_READ.
+    SYS_MEMORY_CREATE_PAGED = 27, // (usize size, Handle pagerEnd) -> Handle to a paged object: its pages
+                                  //   come on demand from a pager (memory-mapped files). pagerEnd (one end
+                                  //   of a channel, RIGHT_WRITE) moves to the kernel; each page a program
+                                  //   touches that isn't there yet arrives as a PageRequest at its peer,
+                                  //   and the toucher waits. The handle can't write (RIGHT_WRITE dropped).
+    SYS_MEMORY_SUPPLY = 28,  // (Handle pager's end, u64 offset, void const* data, u64 length): the pager
+                             //   answers, whole pages (offset and length page aligned). Pages may be
+                             //   dropped again under memory pressure and asked for anew.
 
     // Devices (drivers only: needs a handle given by init)
     SYS_IRQ_WAIT = 30,  // (Handle irq): waits for the interrupt to fire
@@ -136,9 +155,53 @@ enum Syscall : unsigned long {
                                    //   server's thermal throttling (passive cooling) caps the CPU at
                                    //   that share of its performance; 100 lifts the cap. NOT_FOUND if
                                    //   the CPU has no way (no HWP, no clock modulation).
+    SYS_TASK_LIST = 47,    // (TaskInfo* out, usize capacity) -> how many tasks exist (up to `capacity` of
+                           //   them are written): each one's name, CPU time and memory.
+    SYS_KERNEL_STATS = 48, // (KernelStats* out): the kernel's own memory (heap, page tables, promises).
+};
+
+// SYS_TASK_LIST: one task. Memory counts whole bytes.
+struct TaskInfo {
+    unsigned long id;
+    char name[32];
+    unsigned char privilege; // TASK_APP, TASK_SYSTEM, TASK_ROOT
+    unsigned char state;     // TASK_READY, TASK_RUNNING, TASK_WAITING
+    unsigned short reserved;
+    unsigned int regions;    // memory regions it has mapped
+    unsigned long cpuMs;
+    unsigned long residentBytes;  // private memory it holds now
+    unsigned long committedBytes; // private memory it may touch (reserved; taken as touched)
+    unsigned long sharedBytes;    // shared memory it maps (others' too)
+};
+constexpr unsigned char TASK_APP = 0, TASK_SYSTEM = 1, TASK_ROOT = 2;
+constexpr unsigned char TASK_READY = 0, TASK_RUNNING = 1, TASK_WAITING = 2;
+
+// SYS_KERNEL_STATS.
+struct KernelStats {
+    unsigned long heapBytes, heapPeakBytes, heapPages; // the kernel heap
+    unsigned long heapAllocations, heapFailures;
+    unsigned long pageTablePages;
+    unsigned long promisedBytes; // promised to programs, not taken yet
+    unsigned long fileBytes;     // memory-mapped files' pages in memory (dropped first when memory is short)
 };
 
 constexpr unsigned long INTERRUPTS_ROUTE = 1, INTERRUPTS_APIC = 2;
+
+constexpr unsigned long MEMORY_BELOW_4G = 1;        // SYS_MEMORY_CREATE
+constexpr unsigned long MAP_COPY = 1, MAP_READ_ONLY = 2; // SYS_MEMORY_MAP
+
+// SYS_MEMORY_INFO.
+struct MemoryInfo {
+    unsigned long size; // bytes (page aligned)
+    unsigned long flags;
+};
+constexpr unsigned long MEMORY_SEALED = 1, MEMORY_READ_ONLY = 2, MEMORY_PAGED = 4;
+
+// What a paged object's pager receives: supply [offset, offset + length).
+struct PageRequest {
+    unsigned long offset;
+    unsigned long length;
+};
 
 constexpr unsigned long POWER_OFF = 1, POWER_RESTART = 2;
 constexpr unsigned long PCI_WRITE = 0x100;

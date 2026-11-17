@@ -19,9 +19,10 @@ Core::Task* start(char const* name, usize nameLength, Core::Capability const* ha
 // Whether the boot image has a program called `name`.
 bool exists(char const* name, usize nameLength);
 
-// Like start, for a program image in memory (an installed app). `name`
-// is only its task's name.
-Core::Task* startImage(char const* name, u8 const* data, usize size, Core::Capability const* handles,
+// Like start, for a program image in memory (an installed app). `image` must
+// be sealed (nothing may change it under the program); the task keeps its
+// own references to it. `name` is only its task's name.
+Core::Task* startImage(char const* name, Core::SharedMemory* image, usize size, Core::Capability const* handles,
                        usize handleCount, Abi::Error& code, char const*& error);
 
 // A data file from the boot image as read-only shared memory (made on first

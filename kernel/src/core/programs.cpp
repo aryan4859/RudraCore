@@ -33,24 +33,36 @@ void init(Boot::Info const& info) {
     bootInfo = &info;
 }
 
-Core::SharedMemory* file(char const* name) {
+// Boot module `i` as a sealed memory object (made once, kept by the cache):
+// its own pages when they're page aligned (nothing copied: every program
+// started from it shares them), else a copy.
+Core::SharedMemory* moduleObject(usize i) {
     static Core::SharedMemory* cache[Boot::Info::MAX_MODULES] = {};
-    for (usize i = 0; bootInfo and i < bootInfo->moduleCount; i++) {
-        Boot::Module const& module = bootInfo->modules[i];
-        usize n = 0;
-        while (name[n])
-            n++;
-        if (not nameEquals(module.name, name, n))
-            continue;
-        if (not cache[i]) {
-            Core::SharedMemory* memory = Core::SharedMemory::allocate(module.size);
-            if (not memory)
-                return nullptr;
-            memcpy(Mem::toVirtual<u8>(memory->physical), module.data, module.size);
-            memory->readOnly = true;
-            cache[i] = memory; // the cache keeps this first reference
-        }
+    if (cache[i])
         return cache[i];
+    Boot::Module const& module = bootInfo->modules[i];
+    u64 physical = reinterpret_cast<u64>(module.data) - Mem::hhdmOffset;
+    Core::SharedMemory* memory = nullptr;
+    if (physical % Mem::PAGE_SIZE == 0) {
+        memory = Core::SharedMemory::bootFile(physical, module.size);
+    } else {
+        memory = Core::SharedMemory::allocate(module.size);
+        if (not memory)
+            return nullptr;
+        memcpy(Mem::toVirtual<u8>(memory->physical), module.data, module.size);
+        memory->readOnly = memory->sealed = true;
+    }
+    cache[i] = memory; // the cache keeps this first reference
+    return memory;
+}
+
+Core::SharedMemory* file(char const* name) {
+    usize n = 0;
+    while (name[n])
+        n++;
+    for (usize i = 0; bootInfo and i < bootInfo->moduleCount; i++) {
+        if (nameEquals(bootInfo->modules[i].name, name, n))
+            return moduleObject(i);
     }
     return nullptr;
 }
@@ -63,19 +75,26 @@ bool exists(char const* name, usize nameLength) {
     return false;
 }
 
-Core::Task* startImage(char const* name, u8 const* data, usize size, Core::Capability const* handles,
+Core::Task* startImage(char const* name, Core::SharedMemory* image, usize size, Core::Capability const* handles,
                        usize handleCount, Abi::Error& code, char const*& error) {
     Elf::Program program;
-    if (not Elf::load(data, size, program, error)) {
+    if (not Elf::load(image, size, program, error)) {
         code = error == Elf::OUT_OF_MEMORY ? Abi::OUT_OF_MEMORY : Abi::INVALID_ARGUMENT;
         dropHandles(handles, handleCount);
         return nullptr;
     }
-    Core::Task* task = Sched::spawnUser(name, program.space, program.entry, program.stackTop, handles, handleCount);
+    Core::Task* task = Sched::createUser(name, program.space, program.entry, program.stackTop, handles, handleCount);
     if (not task) {
         code = Abi::OUT_OF_MEMORY;
         error = "out of memory";
+        return nullptr;
     }
+    if (not Elf::mapRegions(*task, image, size, program, error)) {
+        Sched::discard(task); // (drops the handles too)
+        code = Abi::OUT_OF_MEMORY;
+        return nullptr;
+    }
+    Sched::startTask(task);
     return task;
 }
 
@@ -88,13 +107,14 @@ Core::Task* start(char const* name, usize nameLength, Core::Capability const* ha
             break;
         }
     }
-    if (not module) {
-        code = Abi::NOT_FOUND;
-        error = "no such program";
+    Core::SharedMemory* image = module ? moduleObject(static_cast<usize>(module - bootInfo->modules)) : nullptr;
+    if (not image) {
+        code = module ? Abi::OUT_OF_MEMORY : Abi::NOT_FOUND;
+        error = module ? "out of memory" : "no such program";
         dropHandles(handles, handleCount);
         return nullptr;
     }
-    return startImage(module->name, module->data, module->size, handles, handleCount, code, error);
+    return startImage(module->name, image, module->size, handles, handleCount, code, error);
 }
 
 } // namespace Rudracore::Programs
